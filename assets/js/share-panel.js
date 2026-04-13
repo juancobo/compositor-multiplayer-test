@@ -1,6 +1,6 @@
 /**
  * Share Panel Functionality
- * @version v1.0.0-beta
+ * @version v1.1.0
  *
  * Handles share link and embed code generation for Telar stories.
  * Redesigned with pill-style tabs and unified privacy toggle.
@@ -65,6 +65,14 @@
       });
     }
 
+    const shareCopyViewBtn = document.getElementById('share-copy-view-btn');
+    if (shareCopyViewBtn) {
+      shareCopyViewBtn.addEventListener('click', function() {
+        const input = document.getElementById('share-view-url-input');
+        if (input) copyToClipboard(input.value, this);
+      });
+    }
+
     if (embedCopyCodeBtn) {
       embedCopyCodeBtn.addEventListener('click', function() {
         const textarea = document.getElementById('embed-code-textarea');
@@ -92,6 +100,7 @@
         shareKeyWithoutBtn.classList.add('active');
         shareKeyWithBtn.classList.remove('active');
         updateShareUrl();
+        updateViewUrl();
         updateEmbedCode();
         updateWarnings();
       });
@@ -103,6 +112,7 @@
         shareKeyWithBtn.classList.add('active');
         shareKeyWithoutBtn.classList.remove('active');
         updateShareUrl();
+        updateViewUrl();
         updateEmbedCode();
         updateWarnings();
       });
@@ -199,6 +209,7 @@
 
     // Update URLs
     updateShareUrl();
+    updateViewUrl();
     updateSiteUrl();
     updateEmbedCode();
     updateWarnings();
@@ -301,6 +312,37 @@
       }
     } else {
       shareUrlInput.value = '';
+    }
+  }
+
+  /**
+   * Update view URL input (story URL with deep-link fragment)
+   */
+  function updateViewUrl() {
+    const shareViewUrlInput = document.getElementById('share-view-url-input');
+    if (!shareViewUrlInput) return;
+
+    if (currentStoryUrl) {
+      try {
+        const url = new URL(currentStoryUrl);
+        let cleanUrl = url.origin + url.pathname;
+
+        if (includeKey && storyKey) {
+          cleanUrl += '?key=' + encodeURIComponent(storyKey);
+        }
+
+        // Append current fragment for deep-link
+        const currentHash = window.location.hash;
+        if (currentHash && currentHash !== '#') {
+          cleanUrl += currentHash;
+        }
+
+        shareViewUrlInput.value = cleanUrl;
+      } catch (e) {
+        shareViewUrlInput.value = currentStoryUrl;
+      }
+    } else {
+      shareViewUrlInput.value = '';
     }
   }
 
