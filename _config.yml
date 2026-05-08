@@ -158,3 +158,4 @@ development-features:
   # (Backward compatible: hide_collections also supported)
   skip_collections: false
 story_key: test
+story_key: test
