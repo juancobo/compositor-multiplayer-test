@@ -10,8 +10,8 @@ author: ""
 email: ""
 telar_theme: "trama" # Options: trama, paisajes, neogranadina, santa-barbara, austin, or custom
 logo: ""
-telar_language: "en" # Options: "en" (English), "es" (Español)
-collection_mode: false # Set to true to show objects first with large thumbnails and stories below with small thumbnails (collection-first homepage)
+telar_language: es
+collection_mode: false
 
 # Story Interface Settings
 story_interface:
@@ -157,3 +157,4 @@ development-features:
   # Use this when building a site with only custom pages (no stories or objects)
   # (Backward compatible: hide_collections also supported)
   skip_collections: false
+story_key: test
