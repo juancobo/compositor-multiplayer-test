@@ -1,0 +1,4 @@
+# .compositor-ignored — story IDs the compositor will not
+# resurface as orphans on import. Managed by the compositor
+# DRAFT-03 banner; safe to hand-edit (one ID per line; `#` comments).
+plantilla_en_blanco
