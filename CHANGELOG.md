@@ -4,7 +4,91 @@ All notable changes to Telar will be documented in this file.
 
 ## [Unreleased]
 
-## [1.3.0-beta] - 2026-05-10
+## [1.5.0] - 2026-06-06
+
+Robustness and security release. Runtime and tooling only — no content changes; existing stories, objects, and configuration continue to work unchanged. This release hardens the build pipeline, the story viewer, and the automatic upgrade workflow, adds defensive input handling and output escaping throughout, and removes the last third-party CDN dependency by vendoring the audio waveform library. The automatic upgrade applies everything except two manual steps (see Migration).
+
+### Security
+
+- **Output escaping throughout.** Author-supplied content (titles, alt text, captions, questions and answers, glossary terms, image attributes) is now escaped at every render sink, in both the Python build and the JavaScript runtime. Jinja2 autoescaping is enabled for widget rendering.
+- **TLS certificate verification restored** on all Google Sheets and IIIF manifest fetches (verification had been disabled).
+- **Protected (password-locked) stories.** The build now fails closed if a protected story cannot be encrypted, instead of shipping it as plaintext; PBKDF2 iterations raised from 100,000 to 210,000; encrypted stories no longer expose byline, description, or SEO metadata; the in-browser unlock cache no longer stores decrypted content.
+- **Hardened automatic upgrade workflow.** It now downloads its tooling as a checksum-verified release asset and runs it in isolation, refusing to run unverified code. The target-version input is validated and passed safely.
+- **KaTeX math rendering** is constrained to safe links only.
+- **Path-traversal guards** on object IDs and story layer filenames, and size caps on all remote reads (Sheets, demo bundle, PDFs, IIIF).
+
+### Changed
+
+- **Audio waveform library vendored.** WaveSurfer is now served from your own site instead of a CDN, so audio stories and audio object pages work offline and carry no third-party runtime dependency.
+- **Upgrade engine.** Framework files are now installed atomically (all-or-nothing with backup and restore), and migrations are chained strictly, failing closed on any error.
+- **Dependency floors raised.** Minimum versions bumped for `pandas` (3.0.3), `markdown` (3.10.2), and `cryptography` (48.0.0), plus the test tools `pytest` (9.0.3) and `pytest-cov` (7.1.0). Sites upgrading in place are unaffected — the framework fixes use the standard library — so the new floors apply to fresh installs and the project's own CI.
+
+### Fixed
+
+- **IIIF viewer plate visibility.** The image plate now stays visible when navigating between steps that share the same object, and same-object focal interpolation uses the correct step list.
+- **Story panels.** Closing a panel is handled consistently (no double-close), and opening a layer panel correctly dismisses an already-open panel.
+- **Deep links.** Panel-open timers are cancelled if the reader navigates during load, so a panel no longer pops open over a different step.
+- **YouTube and Google Drive video sizing.** Non-16:9 videos are now sized to their true aspect (or given an intentional dark letterbox frame) instead of floating in the page background.
+- **Audio and scroll-engine lifecycle.** Resolved assorted race conditions and re-initialization issues.
+- **Theme button text.** Restored the button-text color fix (carried from a v1.4.0 hotfix that missed the v1.4.0 tag) so themed buttons no longer render with invisible text.
+- **Story step order.** Steps now render in the order of their `step` number rather than the spreadsheet's saved row order, so a story whose rows ended up out of sequence still displays correctly. Falls back safely to the saved order if step values are missing or non-numeric.
+
+### Migration
+
+- The automatic upgrade applies all of the above. Two manual steps remain, listed in your `UPGRADE_SUMMARY.md` after upgrading:
+  1. Update your two GitHub Actions workflow files (`upgrade.yml`, `build.yml`) by hand — GitHub does not allow the automated upgrade to modify workflow files. Your site keeps building if you skip this; the changes only harden your workflows.
+  2. Re-apply any customizations to the language packs (`en.yml` / `es.yml`), which were refreshed with the new protected-story sharing warnings.
+- No content changes: no CSV schema, story-step, or `_config.yml` key changes.
+
+## [1.4.0] - 2026-05-26
+
+Runtime upgrade with no content changes required. Existing stories, objects, and configuration continue to work unchanged. This release replaces the Tify viewer with a custom, self-hosted OpenSeadragon wrapper and rebuilds the responsive system around a single source of truth, fixing cross-device IIIF centering.
+
+### Fixed
+
+- **Cross-device IIIF centering**: Rewrote the focal-point algorithm using a two-circle model that derives a device-independent focal radius from the authoring aspect ratio and reads the measured text-card rectangle. Fixes focal points landing off-target across viewport widths, high-zoom near-bottom clipping, iPad portrait Y pinning, horizontal drift under zoom, and a low baseline. Verified on iPhone and iPad portrait via iOS Simulator and a 12-cell device matrix.
+
+- **Deep-link and in-story navigation jump**: `navigateToStep()` and `applyDeepLinkOnLoad()` previously used a manual scroll poke that left the scroll engine in a stale state, freezing the IIIF viewer at a partially-interpolated zoom. Both now use a forced immediate scroll with snap-index sync, giving a deterministic jump to the authored position.
+
+- **iOS Safari URL-bar layout jump**: All layout-affecting heights now use `dvh` with a `vh` fallback via `@supports`. Eliminates the reflow that occurred when the Safari URL bar showed or hid on scroll.
+
+- **Notch safe-area clearance**: Applied `env(safe-area-inset-*)` at the credits badge, mobile navigation buttons, and mobile text card using the `max(<offset>, env(...))` idiom.
+
+- **Hover styles on touch devices**: All `:hover` rules are now wrapped in `@media (hover: hover) and (pointer: fine)`, so touch devices no longer show sticky hover states.
+
+- **Reduced-motion compliance**: Smooth scrolling is disabled when `prefers-reduced-motion` is set, and IIIF pan/zoom animations apply immediately under the same preference.
+
+### Added
+
+- **Custom IIIF viewer**: New `assets/js/telar-story/iiif-viewer.js` and `iiif-manifest.js` wrap OpenSeadragon and parse IIIF Presentation API v2 and v3 manifests, supporting multi-page manifests, a pagination chrome for multi-page objects, and an error fallback UI. Scroll-to-zoom and click-to-zoom stay under Telar's scroll-engine control on story plates; object pages opt in to zoom gestures.
+
+- **`layout-mode.js` — responsive runtime module**: Replaces the binary `state.isMobileViewport` flag with a `state.layoutMode` abstraction (`'horizontal'` / `'vertical'`). Owns the single `resize`/`orientationchange` listener in the runtime and reads breakpoints from CSS custom properties so JS and CSS cannot drift.
+
+- **`--telar-*` CSS custom properties**: `_sass/_responsive.scss` is now the single source of truth for layout-affecting constants (breakpoints, card geometry, density tiers, audio/video scaling factors), mirrored to `--telar-*` properties on `:root` for JS to read via `getComputedStyle`.
+
+- **Container queries on `.text-card`**: `container-type: inline-size` added; font size, padding, gap, and line height inside the card now scale off the card's own width.
+
+- **Six `object.viewer.*` language keys** in `en.yml` and `es.yml` (`prev_page`, `next_page`, `page_input_label`, `page_input_aria`, `image_unavailable_title`, `image_unavailable_detail`) for the IIIF viewer chrome and error UI.
+
+### Changed
+
+- **Cascade layer order**: Bootstrap 5.3.0 is now loaded inside a `@layer` cascade layer, so Telar's own rules take precedence without `!important`. Over 150 Bootstrap-fight `!important` declarations removed across `_sass/`.
+
+- **Breakpoints recalibrated**: the vertical layout now activates at widths narrower than 1024px or aspect ratios narrower than 3:4, covering tablets in portrait as well as phones.
+
+- **Height-tier blocks consolidated**: nine `@media (max-height: ...)` blocks across the stylesheets collapsed into one block in `_sass/_responsive.scss`.
+
+- **Vendored OpenSeadragon 6.0.2**: `assets/vendor/openseadragon.min.js` (337 KB) replaces the Tify CDN load. Source and SHA-256 digest are recorded in `assets/vendor/README.md`.
+
+### Removed
+
+- **Tify IIIF viewer and Vue dependency**: removed the Tify CDN stylesheet and module imports from `_layouts/story.html` and `_layouts/object.html`, along with the 56 `!important` declarations in `_sass/_viewer.scss` that existed solely to hide Tify's UI chrome. Tify's ~529 KB CDN payload (469 KB JS + 60 KB CSS) gives way to a 337 KB vendored OpenSeadragon — about 190 KB less viewer code, served locally with no CDN dependency.
+
+- **`state.isMobileViewport`**: replaced by `state.layoutMode`.
+
+- **Stale bundle files**: `assets/js/telar-story.bundle.js` and `assets/js/telar-story-bundle.js` deleted (unreferenced leftovers from an earlier build naming scheme).
+
+## [1.3.0] - 2026-05-10
 
 i18n hygiene plus a new sister-file localization convention. Wires up Telar's existing language packs in places that previously hardcoded English, introduces a sister-file convention for localizing user pages, and refreshes the demo content to reflect current capabilities (multimedia, Telar Compositor, dual storytelling/collections framing).
 
@@ -17,6 +101,8 @@ i18n hygiene plus a new sister-file localization convention. Wires up Telar's ex
 - **JS thumbnail fallback strings hardcoded in English**: `_layouts/index.html` and `_layouts/objects-index.html` now inject `TelarI18n` and `TelarI18nIIIF` constants from the lang values, so the "Failed to load" and "No image" placeholders displayed when a thumbnail fails appear in the site's active language
 
 - **Empty-state messages pointed at the wrong content directory**: empty-state guidance previously told users to add story/object/glossary files to `_stories/`, `_objects/`, or `_glossary/`. Those directories are auto-generated; the canonical user-content paths are under `telar-content/spreadsheets/` and `telar-content/texts/glossary/`. The lang values had the correct paths; wiring them up fixed both the i18n bug and the misleading guidance
+
+- **Migration script language detection for Spanish sites**: `BaseMigration._detect_language()` was looking for `telar_language` nested under the `telar:` block in `_config.yml`, but the key has always been a top-level key. Every Spanish-language site fell through to the English default for migration manual steps. The base class now reads the correct top-level key, so Spanish sites now get the Spanish-language manual steps in `UPGRADE_SUMMARY.md` and (in v1.3.0 specifically) the conditional `acerca.md` creation guard sees the correct language
 
 ### Added
 
@@ -42,7 +128,7 @@ i18n hygiene plus a new sister-file localization convention. Wires up Telar's ex
 
 - **Stale `lang.pages.home_title` key** from both `en.yml` and `es.yml`. Defined since v1.0.0-beta but never referenced from any layout, include, or script
 
-## [1.2.1-beta] - 2026-05-08
+## [1.2.1] - 2026-05-08
 
 Patch release with a demo content fetch fix and project metadata additions.
 

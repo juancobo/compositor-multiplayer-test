@@ -5,7 +5,7 @@
  * steps. Telar supports three video providers — YouTube, Vimeo, and
  * Google Drive — each with its own player API and embed mechanism.
  * Video cards follow the same DOM-at-init, visibility-via-transforms
- * pattern as IIIF cards but use iframe embeds instead of Tify viewers.
+ * pattern as IIIF cards but use iframe embeds instead of IIIF viewers.
  *
  * Layout — when a video step activates, the module calculates the optimal
  * arrangement by comparing how many pixels the video would occupy in a
@@ -37,10 +37,17 @@
  * Google Drive embeds have no player API, so they receive no clip control
  * or autoplay detection.
  *
- * @version v1.0.0-beta
+ * @version v1.5.0
  */
 
 import { state } from './state.js';
+import { onViewportResize } from './layout-mode.js';
+
+// ── CSS custom property reads (SSOT — sourced from _sass/_responsive.scss :root) ──
+const _cs = getComputedStyle(document.documentElement);
+const videoPadFactor    = parseFloat(_cs.getPropertyValue('--telar-video-pad-factor').trim())    || 0.025;
+const videoStackMaxH    = parseFloat(_cs.getPropertyValue('--telar-video-stack-max-h').trim())   || 0.58;
+const videoCardFracSide = parseFloat(_cs.getPropertyValue('--telar-video-card-frac-side').trim()) || 0.35;
 
 // ── Module-level player pool ──────────────────────────────────────────────────
 
@@ -87,6 +94,39 @@ export function loadYouTubeAPI() {
 }
 
 /**
+ * Detect a YouTube video's true aspect ratio from its maxres thumbnail.
+ *
+ * The YouTube IFrame API exposes no client-readable pixel dimensions, and the
+ * oEmbed endpoint returns a placeholder size with no CORS header (so fetch is
+ * blocked). The maxresdefault thumbnail is the only signal that reflects the
+ * real source aspect — but it 404s for old/low-res uploads, and the smaller
+ * thumbnails are letterbox-padded (hqdefault/default to 4:3) or cropped
+ * (mqdefault to 16:9), so they cannot be trusted. We therefore probe ONLY
+ * maxresdefault via an Image (no CORS issue for naturalWidth/Height) and
+ * resolve null when it is missing, leaving the caller to fall back to a dark
+ * letterbox frame.
+ *
+ * @param {string} videoId - YouTube video ID
+ * @returns {Promise<number|null>} aspect ratio (w/h), or null if undetectable
+ */
+export function detectYouTubeAspect(videoId) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      // YouTube serves a tiny grey placeholder (~120x90) when no real maxres
+      // thumbnail exists; require a plausible size before trusting it.
+      if (img.naturalWidth >= 320 && img.naturalHeight >= 180) {
+        resolve(img.naturalWidth / img.naturalHeight);
+      } else {
+        resolve(null);
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
+  });
+}
+
+/**
  * Load the Vimeo Player API once from CDN, returning a Promise that resolves
  * when window.Vimeo.Player is available. Mirrors loadYouTubeAPI() pattern.
  *
@@ -123,7 +163,7 @@ export function loadVimeoAPI() {
  *   - Side-by-side: card left (35% of W), video right in remaining space.
  *   - Stacked: video top (max 58% of H), card below.
  *   The candidate that gives the video more rendered pixels wins.
- *   Mobile override: W < 768 always returns stacked.
+ *   Mobile override: W < --telar-vertical-min-width always returns stacked.
  *
  * @param {number} W - Viewport width in px
  * @param {number} H - Viewport height in px
@@ -131,15 +171,16 @@ export function loadVimeoAPI() {
  * @returns {{ mode: 'side-by-side'|'stacked', video: {left,top,width,height}, card: {left,top,width,height}, padding: number }}
  */
 export function computeVideoLayout(W, H, aspectRatio) {
-  // Mobile override: always stacked
-  if (W < 768) {
+  // Layout mode is determined by state.layoutMode (set by layout-mode.js at boot and on
+  // every resize/orientationchange). On vertical layouts, always use stacked.
+  if (state.layoutMode === 'vertical') {
     return _computeStackedLayout(W, H, aspectRatio);
   }
 
-  const pad = Math.max(8, Math.round(Math.min(W, H) * 0.025));
+  const pad = Math.max(8, Math.round(Math.min(W, H) * videoPadFactor));
 
   // ── Side-by-side candidate ──
-  const cardFracSide = 0.35;
+  const cardFracSide = videoCardFracSide;
   const sideCardW = Math.round(W * cardFracSide);
   const sideVideoMaxW = W - sideCardW - pad * 3;
   const sideVideoMaxH = H - pad * 2;
@@ -153,7 +194,7 @@ export function computeVideoLayout(W, H, aspectRatio) {
 
   // ── Stacked candidate ──
   const stackVideoMaxW = W - pad * 2;
-  const stackVideoMaxH = H * 0.58;
+  const stackVideoMaxH = H * videoStackMaxH;
   let stackVidW = stackVideoMaxW;
   let stackVidH = stackVidW / aspectRatio;
   if (stackVidH > stackVideoMaxH) {
@@ -209,11 +250,43 @@ function _buildStackedResult(W, H, pad, stackVidW, stackVidH) {
   };
 }
 
+/**
+ * Compute the iframe region for a video whose true aspect ratio is unknown
+ * (old YouTube videos with no maxres thumbnail; all Google Drive embeds, which
+ * expose no dimensions API). Rather than guess an aspect and letterbox inside a
+ * mis-shaped box, we fill the whole available region and let the provider's own
+ * player letterbox the video centred on its black background — a cohesive dark
+ * "cinematic frame" instead of a small mis-proportioned box. Mirrors
+ * computeVideoLayout's mode choice but returns the un-fitted bounding region.
+ *
+ * @param {number} W - Viewport width in px
+ * @param {number} H - Viewport height in px
+ * @returns {{ left: number, top: number, width: number, height: number }}
+ */
+export function computeVideoLetterboxRegion(W, H) {
+  const pad = Math.max(8, Math.round(Math.min(W, H) * videoPadFactor));
+  if (state.layoutMode === 'vertical') {
+    return {
+      left: pad,
+      top: pad,
+      width: Math.round(W - pad * 2),
+      height: Math.round(H * videoStackMaxH),
+    };
+  }
+  const cardW = Math.round(W * videoCardFracSide);
+  return {
+    left: cardW + pad * 2,
+    top: pad,
+    width: Math.round(W - cardW - pad * 3),
+    height: Math.round(H - pad * 2),
+  };
+}
+
 /** Compute stacked layout for mobile. */
 function _computeStackedLayout(W, H, aspectRatio) {
-  const pad = Math.max(8, Math.round(Math.min(W, H) * 0.025));
+  const pad = Math.max(8, Math.round(Math.min(W, H) * videoPadFactor));
   const stackVideoMaxW = W - pad * 2;
-  const stackVideoMaxH = H * 0.58;
+  const stackVideoMaxH = H * videoStackMaxH;
   let stackVidW = stackVideoMaxW;
   let stackVidH = stackVidW / aspectRatio;
   if (stackVidH > stackVideoMaxH) {
@@ -467,9 +540,8 @@ export function activateVideoCard(plateEl, sceneIndex) {
   // Apply auto-layout
   _applyVideoLayout(plateEl);
 
-  const isEmbed = document.body.classList.contains('embed-mode');
-  // Autoplay policy — always manual on mobile and embed
-  if (state.isMobileViewport || isEmbed) {
+  // Autoplay policy — always manual on vertical layout and embed
+  if (state.layoutMode === 'vertical' || state.isEmbed) {
     if (!state.hasUserInteracted) {
       _showVideoPlayOverlay(plateEl);
       return;
@@ -579,6 +651,19 @@ function _createYouTubePlayer(plateEl, videoId, opts) {
   const container = document.createElement('div');
   container.className = 'video-iframe';
   plateEl.appendChild(container);
+
+  // Detect the real aspect ratio so the box fills cleanly (like Vimeo). If the
+  // maxres thumbnail is missing (old videos), fall back to the dark letterbox
+  // frame. Async; re-applies the layout once it resolves.
+  detectYouTubeAspect(videoId).then((aspect) => {
+    if (aspect) {
+      plateEl.dataset.aspectRatio = String(aspect);
+      delete plateEl.dataset.videoLetterbox;
+    } else {
+      plateEl.dataset.videoLetterbox = 'true';
+    }
+    _applyVideoLayout(plateEl);
+  });
 
   const wrapper = {
     type: 'youtube',
@@ -775,6 +860,12 @@ function _createGDriveEmbed(plateEl, videoId, sceneIndex) {
   iframe.allowFullscreen = true;
   iframe.style.cssText = 'width:100%;height:100%;border:none;border-radius:4px';
 
+  // Google Drive exposes no dimensions API, so the true aspect is unknowable.
+  // Use the dark letterbox frame: Drive's preview player already letterboxes
+  // the video centred on black, so filling the region reads as a real player.
+  // Set before the caller's _applyVideoLayout so the region is applied at once.
+  plateEl.dataset.videoLetterbox = 'true';
+
   plateEl.appendChild(iframe);
 
   return {
@@ -841,40 +932,54 @@ function _getWrapperForPlate(plateEl) {
 
 /**
  * Apply the auto-layout algorithm to a video plate.
- * Positions the iframe and (if present) the text card within the plate.
+ * Positions the video iframe within the plate. (The text card is positioned by
+ * card-pool.js / CSS, not here — `computeVideoLayout`'s `card`/`padding` slots
+ * are intentionally unused by this function.)
  *
  * @param {HTMLElement} plateEl - The video plate element
  */
 function _applyVideoLayout(plateEl) {
   const W = window.innerWidth;
   const H = window.innerHeight;
-  const aspectRatio = parseFloat(plateEl.dataset.aspectRatio) || 16 / 9;
 
-  const layout = computeVideoLayout(W, H, aspectRatio);
-
-  // Position the video iframe
   const videoEl = plateEl.querySelector('.video-iframe');
-  if (videoEl) {
+  if (!videoEl) return;
+
+  // Unknown-aspect path: when the true aspect ratio could not be determined
+  // (old YouTube videos without a maxres thumbnail; all Google Drive embeds),
+  // fill the whole available region on a dark frame and let the provider's
+  // player letterbox the video itself, instead of guessing an aspect ratio.
+  if (plateEl.dataset.videoLetterbox === 'true') {
+    const region = computeVideoLetterboxRegion(W, H);
+    videoEl.classList.add('video-iframe--letterbox');
     videoEl.style.position = 'absolute';
-    videoEl.style.left = `${layout.video.left}px`;
-    videoEl.style.top = `${layout.video.top}px`;
-    videoEl.style.width = `${layout.video.width}px`;
-    videoEl.style.height = `${layout.video.height}px`;
+    videoEl.style.left = `${region.left}px`;
+    videoEl.style.top = `${region.top}px`;
+    videoEl.style.width = `${region.width}px`;
+    videoEl.style.height = `${region.height}px`;
+    return;
   }
+
+  // Known-aspect path: size the box to the video's real aspect ratio so it
+  // fills with no letterboxing (Vimeo always; YouTube when maxres detection
+  // succeeded). Default 16:9 only as a last resort.
+  videoEl.classList.remove('video-iframe--letterbox');
+  const aspectRatio = parseFloat(plateEl.dataset.aspectRatio) || 16 / 9;
+  const layout = computeVideoLayout(W, H, aspectRatio);
+  videoEl.style.position = 'absolute';
+  videoEl.style.left = `${layout.video.left}px`;
+  videoEl.style.top = `${layout.video.top}px`;
+  videoEl.style.width = `${layout.video.width}px`;
+  videoEl.style.height = `${layout.video.height}px`;
 }
 
-// ── Resize handler ────────────────────────────────────────────────────────────
+// ── Viewport-resize subscription ─────────────────────────────────────────────
 
-let _resizeDebounceTimer = null;
-
-window.addEventListener('resize', () => {
-  if (_resizeDebounceTimer) clearTimeout(_resizeDebounceTimer);
-  _resizeDebounceTimer = setTimeout(() => {
-    // Recompute layout for all active video plates
-    for (const wrapper of _videoPlayers) {
-      if (wrapper.element && wrapper.element.classList.contains('is-active')) {
-        _applyVideoLayout(wrapper.element);
-      }
+onViewportResize(() => {
+  // Recompute layout for all active video plates
+  for (const wrapper of _videoPlayers) {
+    if (wrapper.element && wrapper.element.classList.contains('is-active')) {
+      _applyVideoLayout(wrapper.element);
     }
-  }, 100);
+  }
 });

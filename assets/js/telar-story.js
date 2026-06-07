@@ -43,9 +43,14 @@
     // ── Autoplay policy ──────────────────────────────────────────────────────
     /** Set true on first play overlay tap; enables autoplay for all subsequent media cards. */
     hasUserInteracted: false,
-    // ── Mobile / embed button navigation ─────────────────────────────────────
-    /** Whether the viewport is below the mobile breakpoint (768 px). */
-    isMobileViewport: false,
+    // ── Layout mode & embed ──────────────────────────────────────────────────
+    /** @type {'horizontal' | 'vertical'} Layout mode. Updated by layout-mode.js on every resize/orientationchange. */
+    layoutMode: "horizontal",
+    /** Page-level boolean, set once at boot from window.telarEmbed.enabled. Orthogonal to layoutMode. */
+    isEmbed: false,
+    /** @type {DOMRect | null} Active text card's getBoundingClientRect; null when no active text card (title card, full-object mode). Populated by card-pool.js on activation + layout-mode.js on layoutchange. */
+    cardOverlayRect: null,
+    // ── Mobile button navigation ─────────────────────────────────────────────
     /** Index of the current step in mobile/embed button mode. */
     currentMobileStep: 0,
     /** Whether mobile navigation is showing the intro card (before step 0). */
@@ -67,6 +72,13 @@
     /** Current object run tracking (for peek stack positioning). */
     currentObjectRun: { objectId: null, runPosition: 0 },
     // ── Scene maps (populated at initCardPool time) ───────────────────────────
+    /**
+     * Filtered step data (metadata rows removed), in the same index space as
+     * stepToScene / the card pool. Populated by initCardPool. The per-frame
+     * lerp reads this so its stepIndex (a filtered-space index) lines up with
+     * the step objects it interpolates between.
+     */
+    stepsData: [],
     /** Map of stepIndex -> sceneIndex. Populated by buildSceneMaps at init. */
     stepToScene: {},
     /** Map of sceneIndex -> objectId. */
@@ -77,7 +89,7 @@
     totalScenes: 0,
     // ── Viewer preloading config (set from telarConfig in main.js) ───────────
     config: {
-      /** Maximum Tify instances kept in memory (per-scene pool cap). */
+      /** Maximum IIIF wrapper instances kept in memory (per-scene pool cap). */
       maxViewerCards: 8,
       /** Steps to preload ahead of the current position. */
       preloadSteps: 6,
@@ -88,7 +100,95 @@
     }
   };
 
+  // assets/js/telar-story/layout-mode.js
+  var layoutChangeSubs = /* @__PURE__ */ new Set();
+  var viewportResizeSubs = /* @__PURE__ */ new Set();
+  var _cachedMode = null;
+  var _breakpoints = null;
+  var _modeMql = null;
+  var _resizeTimer = null;
+  var DEBOUNCE_MS = 100;
+  var _initialized = false;
+  function _readBreakpoints() {
+    const cs = getComputedStyle(document.documentElement);
+    const minW = parseFloat(cs.getPropertyValue("--telar-vertical-min-width").trim()) || 1024;
+    const minA = parseFloat(cs.getPropertyValue("--telar-vertical-min-aspect").trim()) || 0.75;
+    return { verticalMinWidth: minW, verticalMinAspect: minA };
+  }
+  function _evaluateMode() {
+    return _modeMql.matches ? "vertical" : "horizontal";
+  }
+  function _dispatchLayoutChange() {
+    const next = _evaluateMode();
+    const prev = _cachedMode;
+    _cachedMode = next;
+    if (prev !== null && prev !== next) {
+      const viewport = { w: window.innerWidth, h: window.innerHeight };
+      for (const cb of layoutChangeSubs) {
+        try {
+          cb({ from: prev, to: next, viewport, isEmbed: state.isEmbed });
+        } catch (e) {
+          console.error("[layout-mode] onLayoutChange handler threw:", e);
+        }
+      }
+    }
+  }
+  function _dispatchViewportResize() {
+    const viewport = { w: window.innerWidth, h: window.innerHeight };
+    for (const cb of viewportResizeSubs) {
+      try {
+        cb({ viewport });
+      } catch (e) {
+        console.error("[layout-mode] onViewportResize handler threw:", e);
+      }
+    }
+  }
+  function _onResize() {
+    if (_resizeTimer) clearTimeout(_resizeTimer);
+    _resizeTimer = setTimeout(_dispatchViewportResize, DEBOUNCE_MS);
+  }
+  function _onOrientationChange() {
+    if (_resizeTimer) clearTimeout(_resizeTimer);
+    _dispatchLayoutChange();
+    _dispatchViewportResize();
+  }
+  function _initOnce() {
+    if (_initialized) return;
+    _initialized = true;
+    _breakpoints = _readBreakpoints();
+    const { verticalMinWidth: minW, verticalMinAspect: minA } = _breakpoints;
+    _modeMql = window.matchMedia(`(max-width: ${minW}px), (max-aspect-ratio: ${minA})`);
+    _cachedMode = _evaluateMode();
+    _modeMql.addEventListener("change", _dispatchLayoutChange);
+    window.addEventListener("resize", _onResize, { passive: true });
+    window.addEventListener("orientationchange", _onOrientationChange, { passive: true });
+  }
+  function getLayoutMode() {
+    _initOnce();
+    return _cachedMode;
+  }
+  function onLayoutChange(cb) {
+    _initOnce();
+    layoutChangeSubs.add(cb);
+    return () => layoutChangeSubs.delete(cb);
+  }
+  function onViewportResize(cb) {
+    _initOnce();
+    viewportResizeSubs.add(cb);
+    return () => viewportResizeSubs.delete(cb);
+  }
+  function isLandscapeSideCard() {
+    const raw = getComputedStyle(document.documentElement).getPropertyValue("--telar-card-landscape-max-height");
+    const maxH = parseFloat(raw) || 480;
+    return window.matchMedia(`(max-height: ${maxH}px)`).matches;
+  }
+
   // assets/js/telar-story/utils.js
+  function escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = text == null ? "" : String(text);
+    return div.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
   function getBasePath() {
     const pathParts = window.location.pathname.split("/").filter((p) => p);
     if (pathParts.length >= 2) {
@@ -107,17 +207,6 @@
       }
     });
     return tempDiv.innerHTML;
-  }
-  function calculateViewportPosition(viewport, x, y, zoom) {
-    const homeZoom = viewport.getHomeZoom();
-    const imageBounds = viewport.getHomeBounds();
-    const point = {
-      x: imageBounds.x + x * imageBounds.width,
-      y: imageBounds.y + y * imageBounds.height
-    };
-    const VIEWER_INSET = 0.98;
-    const actualZoom = homeZoom * zoom * VIEWER_INSET;
-    return { point, actualZoom };
   }
 
   // assets/js/telar-story/viewer.js
@@ -143,30 +232,42 @@
     const basePath = getBasePath();
     if (page) {
       const manifestUrl2 = `${window.location.origin}${basePath}/iiif/objects/${objectId}/page-${page}/manifest.json`;
-      console.log("Building local IIIF page manifest URL:", manifestUrl2);
       return manifestUrl2;
     }
     const manifestUrl = `${window.location.origin}${basePath}/iiif/objects/${objectId}/manifest.json`;
-    console.log("Building local IIIF manifest URL:", manifestUrl);
     return manifestUrl;
   }
+  var _PREFETCH_SKIP_HOSTS = ["youtube.com", "youtu.be", "vimeo.com", "drive.google.com"];
   async function prefetchStoryManifests() {
     const objectIds = [...new Set(
       Array.from(document.querySelectorAll("[data-object]")).map((el) => el.dataset.object).filter(Boolean)
     )];
     if (objectIds.length === 0) return;
-    await Promise.all(objectIds.map(async (id) => {
-      try {
-        const objectData = state.objectsIndex[id];
-        if (objectData?.iiif_manifest) {
+    const manifestUrls = [...new Set(
+      objectIds.map((id) => state.objectsIndex[id]).map((o) => (o && (o.source_url || o.iiif_manifest) || "").trim()).filter((url) => url && !_PREFETCH_SKIP_HOSTS.some((h) => url.includes(h)))
+    )];
+    if (manifestUrls.length === 0) {
+      adjustThresholdsForConnection();
+      return;
+    }
+    const CONCURRENCY = 3;
+    const queue = [...manifestUrls];
+    const worker = async () => {
+      while (queue.length) {
+        const url = queue.shift();
+        try {
           const start = performance.now();
-          await fetch(objectData.iiif_manifest);
-          const elapsed = performance.now() - start;
-          state.manifestLoadTimes.push(elapsed);
+          const resp = await fetch(url, { cache: "force-cache" });
+          await resp.text().catch(() => {
+          });
+          state.manifestLoadTimes.push(performance.now() - start);
+        } catch (e) {
         }
-      } catch (e) {
       }
-    }));
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker)
+    );
     adjustThresholdsForConnection();
   }
   function adjustThresholdsForConnection() {
@@ -175,27 +276,22 @@
     if (avgTime > 1e3) {
       state.config.loadingThreshold = 1;
       state.config.minReadyViewers = Math.min(6, state.config.preloadSteps);
-      console.log(`Slow connection detected (${Math.round(avgTime)}ms avg), adjusting thresholds`);
     } else if (avgTime > 500) {
       state.config.loadingThreshold = Math.max(3, state.config.loadingThreshold - 2);
       state.config.minReadyViewers = Math.min(state.config.minReadyViewers + 1, state.config.preloadSteps);
-      console.log(`Moderate connection detected (${Math.round(avgTime)}ms avg), adjusting thresholds`);
     }
   }
   function initializeLoadingShimmer() {
     const uniqueViewers = new Set(
       state.steps.map((step) => step.dataset.object).filter(Boolean)
     ).size;
-    console.log(`Story has ${uniqueViewers} unique viewers (threshold: ${state.config.loadingThreshold})`);
     if (uniqueViewers >= state.config.loadingThreshold) {
       showViewerSkeletonState();
-      console.log(`Showing initial load shimmer (${uniqueViewers} >= ${state.config.loadingThreshold})`);
       const checkReadyViewers = () => {
         const readyCount = state.viewerCards.filter((v) => v.isReady).length;
         const targetReady = Math.min(state.config.minReadyViewers, uniqueViewers);
         if (readyCount >= targetReady) {
           hideViewerSkeletonState();
-          console.log(`Hiding shimmer: ${readyCount} viewers ready (target: ${targetReady})`);
         } else {
           setTimeout(checkReadyViewers, 200);
         }
@@ -264,48 +360,656 @@
     return match ? match[1] : null;
   }
 
+  // assets/js/telar-story/iiif-manifest.js
+  function extractAllPages(manifest) {
+    const v3Pages = extractV3Pages(manifest);
+    if (v3Pages.length > 0) return v3Pages;
+    const v2Pages = extractV2Pages(manifest);
+    if (v2Pages.length > 0) return v2Pages;
+    return [];
+  }
+  function extractV3Pages(manifest) {
+    const pages = [];
+    try {
+      const items = manifest.items;
+      if (!items) return pages;
+      for (const canvas of items) {
+        const annoPages = canvas.items;
+        if (!annoPages?.[0]) continue;
+        const annos = annoPages[0].items;
+        if (!annos?.[0]) continue;
+        const body = annos[0].body;
+        if (!body) continue;
+        const service = body.service;
+        if (service?.[0]?.id) {
+          pages.push({ tileSource: service[0].id + "/info.json" });
+          continue;
+        }
+        if (body.id && typeof body.id === "string" && body.type === "Image") {
+          const infoUrl = deriveInfoJsonFromImageUrl(body.id);
+          if (infoUrl) {
+            pages.push({ tileSource: infoUrl });
+            continue;
+          }
+          pages.push({ tileSource: body.id });
+        }
+      }
+    } catch {
+    }
+    return pages;
+  }
+  function extractV2Pages(manifest) {
+    const pages = [];
+    try {
+      const sequences = manifest.sequences;
+      if (!sequences?.[0]) return pages;
+      const canvases = sequences[0].canvases;
+      if (!canvases) return pages;
+      for (const canvas of canvases) {
+        const images = canvas.images;
+        if (!images?.[0]) continue;
+        const resource = images[0].resource;
+        if (!resource) continue;
+        const service = resource.service;
+        if (service?.["@id"]) {
+          pages.push({ tileSource: service["@id"] + "/info.json" });
+          continue;
+        }
+        if (resource["@id"] && typeof resource["@id"] === "string") {
+          pages.push({ tileSource: resource["@id"] });
+        }
+      }
+    } catch {
+    }
+    return pages;
+  }
+  function deriveInfoJsonFromImageUrl(url) {
+    const match = url.match(/^(.+\/iiif\/\d+\/[^/]+)\/[^/]+\/[^/]+\/[^/]+\/[^/]+$/);
+    if (match) return match[1] + "/info.json";
+    return null;
+  }
+
+  // assets/js/telar-story/test-hook.js
+  function testEnabled() {
+    if (typeof window === "undefined") return false;
+    if (window.__TELAR_TEST_HOOK__ === true) return true;
+    try {
+      return /[?&]telartest=1(?:&|$)/.test(window.location.search);
+    } catch {
+      return false;
+    }
+  }
+  var registry = [];
+  var installed = false;
+  function registerTestViewer(wrapper) {
+    if (!testEnabled() || !wrapper) return;
+    if (!registry.includes(wrapper)) registry.push(wrapper);
+    installTestHook();
+  }
+  function unregisterTestViewer(wrapper) {
+    const i = registry.indexOf(wrapper);
+    if (i >= 0) registry.splice(i, 1);
+  }
+  function visibleArea(el) {
+    const r = el.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const w = Math.max(0, Math.min(vw, r.right) - Math.max(0, r.left));
+    const h = Math.max(0, Math.min(vh, r.bottom) - Math.max(0, r.top));
+    return w * h;
+  }
+  function getActiveViewer() {
+    const live = registry.filter(
+      (w) => w && w.viewer && !w._destroyed && w.containerEl && document.contains(w.containerEl)
+    );
+    if (live.length === 0) return null;
+    const plateOf = (w) => w.containerEl.closest(".viewer-plate");
+    const zOf = (w) => {
+      const p = plateOf(w);
+      const z = p ? parseInt(getComputedStyle(p).zIndex, 10) : NaN;
+      return Number.isNaN(z) ? -Infinity : z;
+    };
+    const isActive = (w) => !!plateOf(w)?.classList.contains("is-active");
+    const pool = live.some(isActive) ? live.filter(isActive) : live;
+    pool.sort(
+      (a, b) => zOf(b) - zOf(a) || visibleArea(b.containerEl) - visibleArea(a.containerEl)
+    );
+    return pool[0];
+  }
+  function isSettled() {
+    const w = getActiveViewer();
+    if (!w || !w.viewer) return false;
+    const vp = w.viewer.viewport;
+    const zc = vp.getZoom(true), zt = vp.getZoom(false);
+    const cc = vp.getCenter(true), ct = vp.getCenter(false);
+    return Math.abs(zc - zt) < 1e-4 && Math.abs(cc.x - ct.x) < 1e-4 && Math.abs(cc.y - ct.y) < 1e-4;
+  }
+  function measure(nx, ny) {
+    const w = getActiveViewer();
+    if (!w) return { error: "no-active-viewer" };
+    const v = w.viewer;
+    const OSD = window.OpenSeadragon;
+    if (!OSD || !v.world || v.world.getItemCount() === 0) return { error: "world-empty" };
+    const item = v.world.getItemAt(0);
+    const cs = item.getContentSize();
+    const vp = v.viewport;
+    const rect = w.containerEl.getBoundingClientRect();
+    const elPt = vp.imageToViewerElementCoordinates(new OSD.Point(nx * cs.x, ny * cs.y));
+    const focalScreenPx = { x: rect.left + elPt.x, y: rect.top + elPt.y };
+    const visImg = vp.viewportToImageRectangle(vp.getBounds(true));
+    const homeZoom = vp.getHomeZoom();
+    const zoom = vp.getZoom(true);
+    const cor = state.cardOverlayRect;
+    return {
+      ok: true,
+      input: { nx, ny },
+      viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1 },
+      imageSize: { w: cs.x, h: cs.y, aspect: cs.x / cs.y },
+      homeZoom,
+      zoom,
+      effectiveNzoom: zoom / homeZoom,
+      // what the runtime actually rendered, vs authored
+      osdConfig: {
+        visibilityRatio: v.visibilityRatio,
+        constrainDuringPan: v.constrainDuringPan,
+        minZoomImageRatio: v.minZoomImageRatio,
+        homeFillsViewer: v.homeFillsViewer
+      },
+      viewerRect: { x: rect.left, y: rect.top, w: rect.width, h: rect.height },
+      focalScreenPx,
+      focalInViewerPx: { x: elPt.x, y: elPt.y },
+      visibleImageRect: { x: visImg.x, y: visImg.y, w: visImg.width, h: visImg.height },
+      cardOverlayRect: cor ? { x: cor.x, y: cor.y, w: cor.width, h: cor.height } : null,
+      layoutMode: state.layoutMode ?? null,
+      activeTitleCardIndex: state.activeTitleCardIndex ?? null
+    };
+  }
+  var DEFAULT_SWEEP_STEPS = [
+    { step: 1, x: 0.5, y: 0.5, zoom: 1 },
+    { step: 2, x: 0.477, y: 0.125, zoom: 8.9 },
+    { step: 3, x: 0.486, y: 0.277, zoom: 10 },
+    { step: 4, x: 0.504, y: 0.415, zoom: 2.9 },
+    { step: 5, x: 0.478, y: 0.883, zoom: 10 },
+    { step: 6, x: 0.5, y: 0.5, zoom: 1 },
+    { step: 19, x: 0.516, y: 0.974, zoom: 10 },
+    { step: 20, x: 0.5, y: 0.5, zoom: 1 }
+  ];
+  async function settleAndMeasure(nx, ny, timeoutMs = 9e3) {
+    const start = Date.now();
+    let streak = 0, lastKey = null;
+    while (Date.now() - start < timeoutMs) {
+      const st = state;
+      if (isSettled() && !(st && st.isSnapping)) {
+        const m = measure(nx, ny);
+        if (m && m.ok) {
+          const key = `${Math.round(m.focalScreenPx.x)},${Math.round(m.focalScreenPx.y)},${m.zoom.toFixed(3)}`;
+          if (key === lastKey) streak++;
+          else {
+            lastKey = key;
+            streak = 0;
+          }
+          if (streak >= 3) return m;
+        }
+      } else {
+        streak = 0;
+      }
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return measure(nx, ny);
+  }
+  async function runSweep(steps) {
+    const nav = window.TelarStory && window.TelarStory.navigateToStep;
+    const out = [];
+    for (const s of steps) {
+      if (nav) nav(s.step);
+      await new Promise((r) => setTimeout(r, 450));
+      const m = await settleAndMeasure(s.x, s.y);
+      out.push({ step: s.step, authored: s, m });
+    }
+    return out;
+  }
+  function maybeAutoCollect() {
+    let params;
+    try {
+      params = new URLSearchParams(window.location.search);
+    } catch {
+      return;
+    }
+    if (!params.has("collect")) return;
+    const url = params.get("collect") || "http://127.0.0.1:8899/collect";
+    const label = params.get("label") || "device";
+    const steps = window.__TELAR_SWEEP_STEPS__ || DEFAULT_SWEEP_STEPS;
+    runSweep(steps).then((results) => {
+      const payload = {
+        label,
+        ua: navigator.userAgent,
+        viewport: { w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio || 1 },
+        results
+      };
+      try {
+        navigator.sendBeacon(url, new Blob([JSON.stringify(payload)], { type: "text/plain" }));
+      } catch (e) {
+        fetch(url, { method: "POST", mode: "no-cors", body: JSON.stringify(payload) }).catch(() => {
+        });
+      }
+    });
+  }
+  function installTestHook() {
+    if (installed || !testEnabled()) return;
+    installed = true;
+    window.__telarTestHook__ = {
+      version: "v1.4.0",
+      registry,
+      getActiveViewer,
+      isSettled,
+      /** Primary API: exact rendered position + footprint of a focal point. */
+      getFocalScreenPosition: measure,
+      measure,
+      /** Convenience: measure a list of `{nx, ny}` (or `{x, y}`) points in one call. */
+      measurePoints(points) {
+        return points.map((p) => measure(Number(p.nx ?? p.x), Number(p.ny ?? p.y)));
+      },
+      runSweep,
+      settleAndMeasure
+    };
+    setTimeout(maybeAutoCollect, 800);
+  }
+
+  // assets/js/telar-story/iiif-viewer.js
+  var IiifViewer = class _IiifViewer {
+    /**
+     * @param {IiifViewerOptions} options
+     */
+    constructor({ container, manifestUrl, startPage = 0, showChrome = false, allowZoomGestures = false }) {
+      if (!window.OpenSeadragon) {
+        throw new Error("IiifViewer: window.OpenSeadragon not loaded \u2014 vendor <script> ordering issue?");
+      }
+      this.containerEl = typeof container === "string" ? document.querySelector(container) : container;
+      if (!this.containerEl) {
+        throw new Error(`IiifViewer: container ${container} not found`);
+      }
+      this.manifestUrl = manifestUrl;
+      this.startPage = startPage;
+      this.showChrome = showChrome;
+      this.allowZoomGestures = allowZoomGestures;
+      this.pages = [];
+      this.currentPage = startPage;
+      this.viewer = null;
+      this._destroyed = false;
+      this._chromeEl = null;
+      this._pageTransitioning = false;
+      this.ready = this._init();
+    }
+    /**
+     * Fetch the manifest, parse pages, and instantiate OpenSeadragon with
+     * Tify-faithful options. Resolves `this.ready` on success; rejects (and
+     * appends `.telar-iiif-error` to the container) on any failure.
+     */
+    async _init() {
+      try {
+        const res = await fetch(this.manifestUrl);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const manifest = await res.json();
+        this.pages = extractAllPages(manifest);
+        if (this.pages.length === 0) throw new Error("No pages extracted from manifest");
+        this.currentPage = Math.max(0, Math.min(this.startPage, this.pages.length - 1));
+        const gestureSettingsMouse = this.allowZoomGestures ? {} : { scrollToZoom: false };
+        this.viewer = new window.OpenSeadragon({
+          element: this.containerEl,
+          tileSources: this.pages[this.currentPage].tileSource,
+          animationTime: 0.4,
+          drawer: "canvas",
+          immediateRender: true,
+          placeholderFillStyle: "grey",
+          preserveImageSizeOnResize: true,
+          preserveViewport: true,
+          showNavigationControl: false,
+          showZoomControl: false,
+          visibilityRatio: 0.2,
+          gestureSettingsMouse
+        });
+        if (!this.allowZoomGestures) {
+          this.viewer.innerTracker.scrollHandler = false;
+          this.viewer.gestureSettingsMouse.clickToZoom = false;
+        }
+        await new Promise((resolve, reject) => {
+          const onFirstOpen = () => {
+            this.viewer.removeHandler("open", onFirstOpen);
+            this.viewer.removeHandler("open-failed", onOpenFailed);
+            requestAnimationFrame(resolve);
+          };
+          const onOpenFailed = (event) => {
+            this.viewer.removeHandler("open", onFirstOpen);
+            this.viewer.removeHandler("open-failed", onOpenFailed);
+            reject(new Error("OSD open-failed: " + (event?.message || "unknown")));
+          };
+          this.viewer.addHandler("open", onFirstOpen);
+          this.viewer.addHandler("open-failed", onOpenFailed);
+        });
+        this.viewer.addHandler("open", () => {
+          this._pageTransitioning = false;
+          this._updateChrome();
+        });
+        this.viewer.addHandler("open-failed", () => {
+          this._pageTransitioning = false;
+          this._updateChrome();
+        });
+        if (this.showChrome && this.pages.length > 1) {
+          this._injectChrome();
+        }
+        registerTestViewer(this);
+      } catch (err) {
+        console.error("IiifViewer: failed to initialise", err);
+        this._injectErrorUI();
+        throw err;
+      }
+    }
+    /**
+     * Open a different page of the manifest. Silent no-op when destroyed,
+     * out of range, or already on the requested page.
+     *
+     * @param {number} n - 0-indexed page number.
+     */
+    setPage(n) {
+      if (this._destroyed) return;
+      if (n === this.currentPage || n < 0 || n >= this.pages.length) return;
+      this.currentPage = n;
+      this._pageTransitioning = true;
+      this.viewer.open(this.pages[n].tileSource);
+      this._updateChrome();
+    }
+    /**
+     * Tear down the viewer and remove injected chrome.
+     *
+     * Idempotent — second and later calls return early via the `_destroyed`
+     * flag. The viewer uses the Canvas2D drawer, so there is no
+     * WebGL context to release before teardown (OpenSeadragon issue #2693
+     * applies only to the WebGL drawer); this simply calls `viewer.destroy()`.
+     */
+    destroy() {
+      if (this._destroyed) return;
+      this._destroyed = true;
+      unregisterTestViewer(this);
+      if (this.viewer) {
+        this.viewer.destroy();
+        this.viewer = null;
+      }
+      if (this._chromeEl) {
+        this._chromeEl.remove();
+        this._chromeEl = null;
+      }
+    }
+    // ── Chrome ─────────────────────────────────────────────────────────────────
+    // Bootstrap Icons chevron paths (16×16, viewBox 0 0 16 16). Inlined so the
+    // wrapper has no SVG-loading dependency; static path data only — no user
+    // input ever reaches these strings.
+    static _CHEVRON_LEFT = "M11.354 1.646a.5.5 0 0 1 0 .708L5.707 8l5.647 5.646a.5.5 0 0 1-.708.708l-6-6a.5.5 0 0 1 0-.708l6-6a.5.5 0 0 1 .708 0z";
+    static _CHEVRON_RIGHT = "M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z";
+    /**
+     * Substitute the wrapper's %{current} and %{total} placeholders in a
+     * lang-key aria template. Returns '' when the template is missing so
+     * a partially-localised installation does not write `undefined` into
+     * an aria-label.
+     *
+     * @param {string|undefined} template
+     * @param {number} current
+     * @param {number} total
+     * @returns {string}
+     */
+    _formatAriaLabel(template, current, total) {
+      if (!template) return "";
+      return template.replace("%{current}", String(current)).replace("%{total}", String(total));
+    }
+    /**
+     * Build the `<svg><path/></svg>` chevron used by prev / next buttons.
+     * createElementNS keeps the SVG in the SVG namespace; setAttribute
+     * carries no XSS risk because the `d` value is a class-level constant.
+     */
+    _makeChevronSvg(pathData) {
+      const NS = "http://www.w3.org/2000/svg";
+      const svg = document.createElementNS(NS, "svg");
+      svg.setAttribute("xmlns", NS);
+      svg.setAttribute("width", "16");
+      svg.setAttribute("height", "16");
+      svg.setAttribute("viewBox", "0 0 16 16");
+      svg.setAttribute("fill", "currentColor");
+      svg.setAttribute("aria-hidden", "true");
+      const path = document.createElementNS(NS, "path");
+      path.setAttribute("d", pathData);
+      svg.appendChild(path);
+      return svg;
+    }
+    /**
+     * Inject the prev / page-input / next pagination pills into the
+     * container. Telar-namespaced class names only (no Bootstrap utility
+     * classes). The pills float over the OSD canvas; positional
+     * styling lives in `_sass/_viewer.scss`.
+     */
+    _injectChrome() {
+      const lang = window.telarViewerLang ?? {};
+      const total = this.pages.length;
+      const current1 = this.currentPage + 1;
+      const wrap = document.createElement("div");
+      wrap.className = "telar-iiif-pagination";
+      const prevBtn = document.createElement("button");
+      prevBtn.type = "button";
+      prevBtn.className = "prev-btn";
+      prevBtn.setAttribute("aria-label", lang.prev_page ?? "Previous page");
+      prevBtn.appendChild(this._makeChevronSvg(_IiifViewer._CHEVRON_LEFT));
+      prevBtn.disabled = this.currentPage === 0;
+      prevBtn.addEventListener("click", () => {
+        if (this.currentPage > 0) this.setPage(this.currentPage - 1);
+      });
+      const labelEl = document.createElement("label");
+      labelEl.className = "visually-hidden";
+      labelEl.textContent = lang.page_input_label ?? "Page number";
+      const inputId = `telar-iiif-page-${Math.random().toString(36).slice(2, 8)}`;
+      labelEl.setAttribute("for", inputId);
+      const input = document.createElement("input");
+      input.type = "number";
+      input.className = "page-input";
+      input.id = inputId;
+      input.min = "1";
+      input.max = String(total);
+      input.value = String(current1);
+      input.setAttribute(
+        "aria-label",
+        this._formatAriaLabel(lang.page_input_aria, current1, total)
+      );
+      input.addEventListener("change", (e) => {
+        const parsed = parseInt(e.target.value, 10);
+        if (Number.isNaN(parsed)) {
+          input.value = String(this.currentPage + 1);
+          return;
+        }
+        const clamped = Math.max(1, Math.min(parsed, this.pages.length));
+        this.setPage(clamped - 1);
+      });
+      const nextBtn = document.createElement("button");
+      nextBtn.type = "button";
+      nextBtn.className = "next-btn";
+      nextBtn.setAttribute("aria-label", lang.next_page ?? "Next page");
+      nextBtn.appendChild(this._makeChevronSvg(_IiifViewer._CHEVRON_RIGHT));
+      nextBtn.disabled = this.currentPage === total - 1;
+      nextBtn.addEventListener("click", () => {
+        if (this.currentPage < this.pages.length - 1) this.setPage(this.currentPage + 1);
+      });
+      wrap.append(prevBtn, labelEl, input, nextBtn);
+      this.containerEl.append(wrap);
+      this._chromeEl = wrap;
+    }
+    /**
+     * Reflect `currentPage` and `_pageTransitioning` back into the
+     * injected chrome (input value, aria-label, prev/next disabled).
+     * No-op when chrome has not been injected (`showChrome` false or
+     * single-page manifest).
+     */
+    _updateChrome() {
+      if (!this._chromeEl) return;
+      const lang = window.telarViewerLang ?? {};
+      const total = this.pages.length;
+      const current1 = this.currentPage + 1;
+      const input = this._chromeEl.querySelector(".page-input");
+      if (input) {
+        input.value = String(current1);
+        input.setAttribute(
+          "aria-label",
+          this._formatAriaLabel(lang.page_input_aria, current1, total)
+        );
+      }
+      const prevBtn = this._chromeEl.querySelector(".prev-btn");
+      if (prevBtn) prevBtn.disabled = this.currentPage === 0 || this._pageTransitioning;
+      const nextBtn = this._chromeEl.querySelector(".next-btn");
+      if (nextBtn) nextBtn.disabled = this.currentPage === total - 1 || this._pageTransitioning;
+    }
+    // ── Error UI ───────────────────────────────────────────────────────────────
+    /**
+     * Append `.telar-iiif-error` to the container when manifest fetch or
+     * OSD instantiation fails. Uses `textContent` for every string and
+     * never assembles HTML strings; reads localised text from
+     * `window.telarViewerLang` with inline English fallbacks so the wrapper
+     * degrades gracefully if the lang injection is missing.
+     */
+    _injectErrorUI() {
+      const div = document.createElement("div");
+      div.className = "telar-iiif-error";
+      div.setAttribute("role", "alert");
+      div.setAttribute("aria-live", "polite");
+      const lang = window.telarViewerLang ?? {};
+      const strong = document.createElement("strong");
+      strong.textContent = lang.image_unavailable_title ?? "Image unavailable";
+      const p = document.createElement("p");
+      p.textContent = lang.image_unavailable_detail ?? "The IIIF image could not be loaded.";
+      div.append(strong, p);
+      this.containerEl.append(div);
+    }
+  };
+
   // assets/js/telar-story/iiif-card.js
+  function _isSane(imageW, imageH, viewportW, viewportH, x, y, zoom) {
+    const fin = (v) => typeof v === "number" && Number.isFinite(v);
+    if (!fin(imageW) || imageW <= 0) return false;
+    if (!fin(imageH) || imageH <= 0) return false;
+    if (!fin(viewportW) || viewportW <= 0) return false;
+    if (!fin(viewportH) || viewportH <= 0) return false;
+    if (!fin(x) || x < 0 || x > 1) return false;
+    if (!fin(y) || y < 0 || y > 1) return false;
+    if (!fin(zoom) || zoom <= 0) return false;
+    return true;
+  }
+  var _CSS_HORIZ_CARD_LEFT = 3 / 100;
+  var _CSS_HORIZ_CARD_WIDTH = 37 / 100;
+  var _CSS_VERT_CARD_H_VH = 40 / 100;
+  var _CSS_VERT_CARD_TOP_FRAC = 1 - _CSS_VERT_CARD_H_VH;
+  function _defaultCardBox(placement, viewportW, viewportH) {
+    if (placement === "horizontal") {
+      return {
+        x: viewportW * _CSS_HORIZ_CARD_LEFT,
+        y: 0,
+        w: viewportW * _CSS_HORIZ_CARD_WIDTH,
+        h: viewportH
+      };
+    }
+    return {
+      x: 0,
+      y: viewportH * _CSS_VERT_CARD_TOP_FRAC,
+      w: viewportW,
+      h: viewportH * _CSS_VERT_CARD_H_VH
+    };
+  }
+  function _deriveCardPlacement(cardBox, viewportW, viewportH) {
+    if (!cardBox) {
+      if (isLandscapeSideCard()) return "horizontal";
+      return state.layoutMode === "vertical" ? "vertical" : "horizontal";
+    }
+    if (cardBox.x + cardBox.w < viewportW * 0.6) return "horizontal";
+    return "vertical";
+  }
+  var AUTHORING_ASPECT = 1.053;
+  var FOCAL_DIAMETER_FRAC = 0.9;
+  function computeFocalTarget(x, y, zoom, imageW, imageH, cardBox, placementMode) {
+    const viewportW = window.innerWidth;
+    const viewportH = window.innerHeight;
+    if (!_isSane(imageW, imageH, viewportW, viewportH, x, y, zoom)) {
+      return null;
+    }
+    const box = cardBox !== null && cardBox !== void 0 ? cardBox : _defaultCardBox(placementMode, viewportW, viewportH);
+    let region;
+    if (placementMode === "horizontal") {
+      const visX = box.x + box.w;
+      region = { x: visX, y: 0, w: viewportW - visX, h: viewportH };
+    } else {
+      region = { x: 0, y: 0, w: viewportW, h: box.y };
+    }
+    const imageAspect = imageW / imageH;
+    const homeZoomAuth = imageAspect / AUTHORING_ASPECT;
+    const frameWidthImg = imageW / (homeZoomAuth * zoom);
+    const diameterImg = FOCAL_DIAMETER_FRAC * frameWidthImg;
+    const focalImg = { x: x * imageW, y: y * imageH };
+    return { focalImg, diameterImg, region, imageW, imageH };
+  }
+  function _clampFocalPx(region, edges, ideal) {
+    const loX = region.x + region.w - edges.eRight;
+    const hiX = region.x + edges.eLeft;
+    const loY = region.y + region.h - edges.eBottom;
+    const hiY = region.y + edges.eTop;
+    return {
+      x: loX <= hiX ? Math.max(loX, Math.min(hiX, ideal.x)) : ideal.x,
+      y: loY <= hiY ? Math.max(loY, Math.min(hiY, ideal.y)) : ideal.y
+    };
+  }
+  function _applyFocalTarget(viewerCard, x, y, zoom, immediate) {
+    const v = viewerCard.osdViewer;
+    const av = viewerCard.osdWrapper;
+    const source = v.world.getItemAt(0)?.source;
+    if (!source?.width || !source?.height) return false;
+    const imgW = source.width;
+    const imgH = source.height;
+    if (state.activeTitleCardIndex != null) return false;
+    const viewportW = window.innerWidth;
+    const viewportH = window.innerHeight;
+    const r = state.cardOverlayRect;
+    const cardBox = r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null;
+    const placementMode = _deriveCardPlacement(cardBox, viewportW, viewportH);
+    const target = computeFocalTarget(x, y, zoom, imgW, imgH, cardBox, placementMode);
+    if (!target) return false;
+    const { focalImg, diameterImg, region } = target;
+    const vp = v.viewport;
+    const OSD = window.OpenSeadragon;
+    const rect = av.containerEl.getBoundingClientRect();
+    const s_tgt = Math.min(region.w, region.h) / diameterImg;
+    const s_cap = Math.min(rect.width / imgW, rect.height / imgH);
+    const s = Math.max(s_tgt, s_cap);
+    const CB = { x: region.x + region.w / 2, y: region.y + region.h / 2 };
+    const edges = {
+      eLeft: focalImg.x * s,
+      eRight: (imgW - focalImg.x) * s,
+      eTop: focalImg.y * s,
+      eBottom: (imgH - focalImg.y) * s
+    };
+    const F = _clampFocalPx(region, edges, CB);
+    const visW = rect.width / s;
+    const visH = rect.height / s;
+    const topLeft = { x: focalImg.x - F.x / s, y: focalImg.y - F.y / s };
+    const targetVp = vp.imageToViewportRectangle(
+      new OSD.Rect(topLeft.x, topLeft.y, visW, visH)
+    );
+    vp.fitBounds(targetVp, immediate);
+    return true;
+  }
   function deactivateIiifCard(viewerCard, direction) {
     if (!viewerCard || !viewerCard.element) return;
     viewerCard.element.classList.remove("is-active");
     if (direction === "backward") {
       viewerCard.element.style.transform = "translateY(100%)";
     }
-    console.log(`deactivateIiifCard: ${viewerCard.objectId} (${direction})`);
-  }
-  function _compensateForCardOverlay(viewport, point, actualZoom) {
-    if (state.isMobileViewport) {
-      const CARD_FRAC_MOBILE = 0.4;
-      const viewportWidth2 = 1 / actualZoom;
-      const aspectRatio = window.innerHeight / window.innerWidth;
-      const viewportHeight = viewportWidth2 * aspectRatio;
-      const shiftY = CARD_FRAC_MOBILE / 2 * viewportHeight;
-      const visibleFraction = 1 - CARD_FRAC_MOBILE;
-      return {
-        point: { x: point.x, y: point.y + shiftY },
-        actualZoom: actualZoom * visibleFraction
-      };
-    }
-    const viewportWidth = 1 / actualZoom;
-    const CARD_FRAC = 0.39;
-    const shiftX = CARD_FRAC / 2 * viewportWidth;
-    return {
-      point: { x: point.x - shiftX, y: point.y },
-      actualZoom
-    };
   }
   function snapIiifToPosition(viewerCard, x, y, zoom) {
     if (!viewerCard || !viewerCard.osdViewer) {
       console.warn("snapIiifToPosition: viewer not ready for snap");
       return;
     }
-    const osdViewer = viewerCard.osdViewer;
-    const viewport = osdViewer.viewport;
-    let { point, actualZoom } = calculateViewportPosition(viewport, x, y, zoom);
-    ({ point, actualZoom } = _compensateForCardOverlay(viewport, point, actualZoom));
-    console.log(`snapIiifToPosition: ${viewerCard.objectId} x=${x} y=${y} zoom=${zoom}`);
-    viewport.panTo(point, true);
-    viewport.zoomTo(actualZoom, point, true);
+    _applyFocalTarget(viewerCard, x, y, zoom, true);
   }
   function animateIiifToPosition(viewerCard, x, y, zoom) {
     if (!viewerCard || !viewerCard.osdViewer) {
@@ -313,18 +1017,14 @@
       return;
     }
     const osdViewer = viewerCard.osdViewer;
-    const viewport = osdViewer.viewport;
-    let { point, actualZoom } = calculateViewportPosition(viewport, x, y, zoom);
-    ({ point, actualZoom } = _compensateForCardOverlay(viewport, point, actualZoom));
-    console.log(`animateIiifToPosition: ${viewerCard.objectId} x=${x} y=${y} zoom=${zoom} over 4s`);
+    const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     osdViewer.gestureSettingsMouse.clickToZoom = false;
     osdViewer.gestureSettingsTouch.clickToZoom = false;
     const originalAnimationTime = osdViewer.animationTime;
     const originalSpringStiffness = osdViewer.springStiffness;
     osdViewer.animationTime = 4;
     osdViewer.springStiffness = 0.8;
-    viewport.panTo(point, false);
-    viewport.zoomTo(actualZoom, point, false);
+    _applyFocalTarget(viewerCard, x, y, zoom, prefersReduced);
     setTimeout(() => {
       osdViewer.animationTime = originalAnimationTime;
       osdViewer.springStiffness = originalSpringStiffness;
@@ -351,6 +1051,34 @@
     if (!viewerCard || !viewerCard.isReady) return;
     snapIiifToPosition(viewerCard, x, y, zoom);
   }
+  function _reSnapActiveViewer() {
+    const viewerCard = state.viewerCards.find(
+      (vc) => vc.element && vc.element.classList.contains("is-active")
+    );
+    if (!viewerCard || !viewerCard.isReady) return;
+    const activeTextCard = document.querySelector(".text-card.is-active");
+    if (!activeTextCard) return;
+    const stepIndex = parseInt(activeTextCard.dataset.stepIndex, 10);
+    if (isNaN(stepIndex)) return;
+    const steps = (window.storyData?.steps || []).filter((s) => !s._metadata);
+    const step = steps[stepIndex];
+    if (!step) return;
+    const x = parseFloat(step.x);
+    const y = parseFloat(step.y);
+    const zoom = parseFloat(step.zoom);
+    if (isNaN(x) || isNaN(y) || isNaN(zoom)) return;
+    snapIiifToPosition(viewerCard, x, y, zoom);
+  }
+  onViewportResize(() => {
+    _reSnapActiveViewer();
+  });
+  onLayoutChange(() => {
+    requestAnimationFrame(() => {
+      const activeCard = document.querySelector(".text-card.is-active");
+      state.cardOverlayRect = activeCard ? activeCard.getBoundingClientRect() : null;
+      _reSnapActiveViewer();
+    });
+  });
 
   // assets/js/telar-story/text-card.js
   function isFullObjectMode(stepData) {
@@ -365,6 +1093,10 @@
   }
 
   // assets/js/telar-story/video-card.js
+  var _cs = getComputedStyle(document.documentElement);
+  var videoPadFactor = parseFloat(_cs.getPropertyValue("--telar-video-pad-factor").trim()) || 0.025;
+  var videoStackMaxH = parseFloat(_cs.getPropertyValue("--telar-video-stack-max-h").trim()) || 0.58;
+  var videoCardFracSide = parseFloat(_cs.getPropertyValue("--telar-video-card-frac-side").trim()) || 0.35;
   var _videoPlayers = [];
   var MAX_VIDEO_PLAYERS = 3;
   function loadYouTubeAPI() {
@@ -386,6 +1118,20 @@
     });
     return window._ytApiPromise;
   }
+  function detectYouTubeAspect(videoId) {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        if (img.naturalWidth >= 320 && img.naturalHeight >= 180) {
+          resolve(img.naturalWidth / img.naturalHeight);
+        } else {
+          resolve(null);
+        }
+      };
+      img.onerror = () => resolve(null);
+      img.src = `https://i.ytimg.com/vi/${videoId}/maxresdefault.jpg`;
+    });
+  }
   function loadVimeoAPI() {
     if (window._vimeoApiPromise) return window._vimeoApiPromise;
     window._vimeoApiPromise = new Promise((resolve, reject) => {
@@ -403,11 +1149,11 @@
     return window._vimeoApiPromise;
   }
   function computeVideoLayout(W, H, aspectRatio) {
-    if (W < 768) {
+    if (state.layoutMode === "vertical") {
       return _computeStackedLayout(W, H, aspectRatio);
     }
-    const pad = Math.max(8, Math.round(Math.min(W, H) * 0.025));
-    const cardFracSide = 0.35;
+    const pad = Math.max(8, Math.round(Math.min(W, H) * videoPadFactor));
+    const cardFracSide = videoCardFracSide;
     const sideCardW = Math.round(W * cardFracSide);
     const sideVideoMaxW = W - sideCardW - pad * 3;
     const sideVideoMaxH = H - pad * 2;
@@ -419,7 +1165,7 @@
     }
     const sideVideoArea = sideVidW * sideVidH;
     const stackVideoMaxW = W - pad * 2;
-    const stackVideoMaxH = H * 0.58;
+    const stackVideoMaxH = H * videoStackMaxH;
     let stackVidW = stackVideoMaxW;
     let stackVidH = stackVidW / aspectRatio;
     if (stackVidH > stackVideoMaxH) {
@@ -467,10 +1213,28 @@
       padding: cardPad
     };
   }
+  function computeVideoLetterboxRegion(W, H) {
+    const pad = Math.max(8, Math.round(Math.min(W, H) * videoPadFactor));
+    if (state.layoutMode === "vertical") {
+      return {
+        left: pad,
+        top: pad,
+        width: Math.round(W - pad * 2),
+        height: Math.round(H * videoStackMaxH)
+      };
+    }
+    const cardW = Math.round(W * videoCardFracSide);
+    return {
+      left: cardW + pad * 2,
+      top: pad,
+      width: Math.round(W - cardW - pad * 3),
+      height: Math.round(H - pad * 2)
+    };
+  }
   function _computeStackedLayout(W, H, aspectRatio) {
-    const pad = Math.max(8, Math.round(Math.min(W, H) * 0.025));
+    const pad = Math.max(8, Math.round(Math.min(W, H) * videoPadFactor));
     const stackVideoMaxW = W - pad * 2;
-    const stackVideoMaxH = H * 0.58;
+    const stackVideoMaxH = H * videoStackMaxH;
     let stackVidW = stackVideoMaxW;
     let stackVidH = stackVidW / aspectRatio;
     if (stackVidH > stackVideoMaxH) {
@@ -622,8 +1386,7 @@
     plateEl.style.transform = "translateY(0)";
     plateEl.classList.add("is-active");
     _applyVideoLayout(plateEl);
-    const isEmbed = document.body.classList.contains("embed-mode");
-    if (state.isMobileViewport || isEmbed) {
+    if (state.layoutMode === "vertical" || state.isEmbed) {
       if (!state.hasUserInteracted) {
         _showVideoPlayOverlay(plateEl);
         return;
@@ -688,6 +1451,15 @@
     const container = document.createElement("div");
     container.className = "video-iframe";
     plateEl.appendChild(container);
+    detectYouTubeAspect(videoId).then((aspect) => {
+      if (aspect) {
+        plateEl.dataset.aspectRatio = String(aspect);
+        delete plateEl.dataset.videoLetterbox;
+      } else {
+        plateEl.dataset.videoLetterbox = "true";
+      }
+      _applyVideoLayout(plateEl);
+    });
     const wrapper = {
       type: "youtube",
       element: plateEl,
@@ -843,6 +1615,7 @@
     iframe.allow = "autoplay";
     iframe.allowFullscreen = true;
     iframe.style.cssText = "width:100%;height:100%;border:none;border-radius:4px";
+    plateEl.dataset.videoLetterbox = "true";
     plateEl.appendChild(iframe);
     return {
       type: "google-drive",
@@ -891,30 +1664,42 @@
   function _applyVideoLayout(plateEl) {
     const W = window.innerWidth;
     const H = window.innerHeight;
+    const videoEl = plateEl.querySelector(".video-iframe");
+    if (!videoEl) return;
+    if (plateEl.dataset.videoLetterbox === "true") {
+      const region = computeVideoLetterboxRegion(W, H);
+      videoEl.classList.add("video-iframe--letterbox");
+      videoEl.style.position = "absolute";
+      videoEl.style.left = `${region.left}px`;
+      videoEl.style.top = `${region.top}px`;
+      videoEl.style.width = `${region.width}px`;
+      videoEl.style.height = `${region.height}px`;
+      return;
+    }
+    videoEl.classList.remove("video-iframe--letterbox");
     const aspectRatio = parseFloat(plateEl.dataset.aspectRatio) || 16 / 9;
     const layout = computeVideoLayout(W, H, aspectRatio);
-    const videoEl = plateEl.querySelector(".video-iframe");
-    if (videoEl) {
-      videoEl.style.position = "absolute";
-      videoEl.style.left = `${layout.video.left}px`;
-      videoEl.style.top = `${layout.video.top}px`;
-      videoEl.style.width = `${layout.video.width}px`;
-      videoEl.style.height = `${layout.video.height}px`;
-    }
+    videoEl.style.position = "absolute";
+    videoEl.style.left = `${layout.video.left}px`;
+    videoEl.style.top = `${layout.video.top}px`;
+    videoEl.style.width = `${layout.video.width}px`;
+    videoEl.style.height = `${layout.video.height}px`;
   }
-  var _resizeDebounceTimer = null;
-  window.addEventListener("resize", () => {
-    if (_resizeDebounceTimer) clearTimeout(_resizeDebounceTimer);
-    _resizeDebounceTimer = setTimeout(() => {
-      for (const wrapper of _videoPlayers) {
-        if (wrapper.element && wrapper.element.classList.contains("is-active")) {
-          _applyVideoLayout(wrapper.element);
-        }
+  onViewportResize(() => {
+    for (const wrapper of _videoPlayers) {
+      if (wrapper.element && wrapper.element.classList.contains("is-active")) {
+        _applyVideoLayout(wrapper.element);
       }
-    }, 100);
+    }
   });
 
   // assets/js/telar-story/audio-card.js
+  var _cs2 = getComputedStyle(document.documentElement);
+  var audioHeightMobile = parseFloat(_cs2.getPropertyValue("--telar-audio-height-mobile").trim()) || 0.35;
+  var audioHeightResize = parseFloat(_cs2.getPropertyValue("--telar-audio-height-resize").trim()) || 0.5;
+  function _audioHeightFraction() {
+    return state.layoutMode === "vertical" || state.isEmbed ? audioHeightMobile : audioHeightResize;
+  }
   var _audioPlayers = [];
   var MAX_AUDIO_PLAYERS = 3;
   var _sharedAudioContext = null;
@@ -925,12 +1710,13 @@
         resolve();
         return;
       }
+      const basePath = getBasePath();
       const script = document.createElement("script");
-      script.src = "https://unpkg.com/wavesurfer.js@7/dist/wavesurfer.min.js";
+      script.src = `${basePath}/assets/vendor/wavesurfer/wavesurfer.min.js`;
       script.async = true;
       script.onload = () => {
         const rScript = document.createElement("script");
-        rScript.src = "https://unpkg.com/wavesurfer.js@7/dist/plugins/regions.min.js";
+        rScript.src = `${basePath}/assets/vendor/wavesurfer/plugins/regions.min.js`;
         rScript.async = true;
         rScript.onload = () => resolve();
         rScript.onerror = () => reject(new Error("WaveSurfer Regions plugin failed to load"));
@@ -1027,6 +1813,8 @@
       loop,
       isEmbed,
       _lastElapsedSecond: -1,
+      _fadeTimer: null,
+      _destroyed: false,
       destroy() {
         destroyAudioPlayer(this);
       }
@@ -1034,8 +1822,10 @@
     _audioPlayers.push(wrapper);
     _enforceAudioPoolLimit(sceneIndex);
     loadWaveSurferAPI().then(() => {
+      if (wrapper._destroyed) return;
       const peaksFetch = peaksUrl ? fetch(peaksUrl).then((r) => r.ok ? r.json() : null).catch(() => null) : Promise.resolve(null);
       peaksFetch.then((peaksData) => {
+        if (wrapper._destroyed) return;
         const styles = getComputedStyle(document.documentElement);
         const accentColor = styles.getPropertyValue("--color-link").trim() || "#883C36";
         const barColor = styles.getPropertyValue("--color-button-text").trim() || "#ffffff";
@@ -1062,7 +1852,7 @@
           barWidth: 4,
           barGap: 5,
           barRadius: 5,
-          height: Math.round(window.innerHeight * 0.35),
+          height: Math.round(window.innerHeight * _audioHeightFraction()),
           interact: false,
           normalize: true,
           backend: "WebAudio",
@@ -1222,11 +2012,19 @@
     plateEl.classList.add("is-active");
     const wrapper = _getAudioWrapperForPlate(plateEl);
     if (!wrapper || !wrapper.ws) return;
+    if (wrapper._fadeTimer) {
+      clearInterval(wrapper._fadeTimer);
+      wrapper._fadeTimer = null;
+      try {
+        wrapper.ws.setVolume(1);
+      } catch (e) {
+      }
+    }
     try {
-      wrapper.ws.setOptions({ height: Math.round(window.innerHeight * 0.35) });
+      wrapper.ws.setOptions({ height: Math.round(window.innerHeight * _audioHeightFraction()) });
     } catch (e) {
     }
-    if (state.isMobileViewport || wrapper.isEmbed) {
+    if (state.layoutMode === "vertical" || state.isEmbed) {
       _showPlayOverlay(plateEl);
       return;
     }
@@ -1255,6 +2053,7 @@
     const steps = Math.ceil(fadeMs / 50);
     let step = 0;
     const startVolume = wrapper.ws.getVolume ? wrapper.ws.getVolume() : 1;
+    if (wrapper._fadeTimer) clearInterval(wrapper._fadeTimer);
     const timer = setInterval(() => {
       step++;
       const newVolume = startVolume * (1 - step / steps);
@@ -1262,10 +2061,12 @@
         wrapper.ws.setVolume(Math.max(0, newVolume));
       } catch (e) {
         clearInterval(timer);
+        wrapper._fadeTimer = null;
         return;
       }
       if (step >= steps) {
         clearInterval(timer);
+        wrapper._fadeTimer = null;
         try {
           wrapper.ws.pause();
           wrapper.ws.setVolume(1);
@@ -1273,9 +2074,15 @@
         }
       }
     }, 50);
+    wrapper._fadeTimer = timer;
   }
   function destroyAudioPlayer(wrapper) {
     if (!wrapper) return;
+    wrapper._destroyed = true;
+    if (wrapper._fadeTimer) {
+      clearInterval(wrapper._fadeTimer);
+      wrapper._fadeTimer = null;
+    }
     try {
       if (wrapper.ws) {
         wrapper.ws.destroy();
@@ -1366,6 +2173,11 @@
     }
   }
   function _evictAudioPlayer(wrapper) {
+    wrapper._destroyed = true;
+    if (wrapper._fadeTimer) {
+      clearInterval(wrapper._fadeTimer);
+      wrapper._fadeTimer = null;
+    }
     try {
       if (wrapper.ws) {
         wrapper.ws.destroy();
@@ -1391,20 +2203,16 @@
 <p>This audio file could not be loaded. Continue scrolling to read the story.</p>`;
     plateEl.appendChild(alertEl);
   }
-  var _audioResizeTimer = null;
-  window.addEventListener("resize", () => {
-    if (_audioResizeTimer) clearTimeout(_audioResizeTimer);
-    _audioResizeTimer = setTimeout(() => {
-      const newHeight = Math.round(window.innerHeight * 0.5);
-      for (const wrapper of _audioPlayers) {
-        if (wrapper.element && wrapper.element.classList.contains("is-active") && wrapper.ws) {
-          try {
-            wrapper.ws.setOptions({ height: newHeight });
-          } catch (e) {
-          }
+  onViewportResize(({ viewport }) => {
+    const newHeight = Math.round(viewport.h * _audioHeightFraction());
+    for (const wrapper of _audioPlayers) {
+      if (wrapper.element && wrapper.element.classList.contains("is-active") && wrapper.ws) {
+        try {
+          wrapper.ws.setOptions({ height: newHeight });
+        } catch (e) {
         }
       }
-    }, 100);
+    }
   });
 
   // assets/js/telar-story/card-pool.js
@@ -1431,7 +2239,10 @@
         runPos = 0;
         currentObjectId = effectiveId;
       }
-      const bandBase = (scene + 1) * 100;
+      if (scene === 97) {
+        console.warn("[Telar] Story has more than 98 unique scenes; z-index banding is clamped at 9800 and panel/UI chrome layering may overlap.");
+      }
+      const bandBase = Math.min((scene + 1) * 100, 9800);
       plateZ[i] = bandBase;
       textCardZ[i] = bandBase + 1 + runPos;
       runPos++;
@@ -1470,6 +2281,7 @@
   var _stepsData = [];
   var _config = { peekHeight: 1, messiness: 20, preloadSteps: 5 };
   var _zPlan = { viewerPlateZ: {}, textCardZ: {} };
+  var _prefetchedScenes = /* @__PURE__ */ new Set();
   function _buildSceneMaps(steps) {
     let scene = -1;
     let currentObjectId = null;
@@ -1496,6 +2308,28 @@
   function buildTransform(messiness, baseTranslate) {
     return `${baseTranslate} rotate(${messiness.rot}deg) translate(${messiness.offX}px, ${messiness.offY}px)`;
   }
+  function _recomputeCardGeometry(viewportW, viewportH) {
+    const peekHeight = _config.peekHeight ?? 1;
+    const landscapeSideCard = isLandscapeSideCard();
+    const cards = document.querySelectorAll(".text-card");
+    for (const card of cards) {
+      const runPos = parseInt(card.dataset.runPosition, 10) || 0;
+      if (landscapeSideCard) {
+        card.style.height = "";
+        const cardH = card.offsetHeight;
+        const topPx = computeCardTop(viewportH, cardH, runPos, peekHeight);
+        card.style.setProperty("top", `${topPx}px`, "important");
+      } else if (getLayoutMode() === "vertical") {
+        card.style.removeProperty("top");
+        card.style.height = `${viewportH * 0.8}px`;
+      } else {
+        const cardH = viewportH * 0.8;
+        const topPx = computeCardTop(viewportH, cardH, runPos, peekHeight);
+        card.style.setProperty("top", `${topPx}px`, "important");
+        card.style.height = `${cardH}px`;
+      }
+    }
+  }
   function initCardPool(storyData, config) {
     const cardStack = document.querySelector(".card-stack");
     if (!cardStack) return;
@@ -1503,6 +2337,7 @@
     const peekHeight = config?.peekHeight ?? 1;
     const messinessPercent = config?.messiness ?? 20;
     _stepsData = steps;
+    state.stepsData = steps;
     _config = {
       peekHeight,
       messiness: messinessPercent,
@@ -1639,22 +2474,29 @@
           const y = parseFloat(firstStep.y);
           const zoom = parseFloat(firstStep.zoom);
           const page = firstStep.page ? parseInt(firstStep.page, 10) : void 0;
-          _initTifyInPlate(plate, firstObjectId, 0, zIndex, x, y, zoom, page);
+          _initOsdInPlate(plate, firstObjectId, 0, zIndex, x, y, zoom, page);
         }
       }
     }
+    onViewportResize(({ viewport }) => {
+      _recomputeCardGeometry(viewport.w, viewport.h);
+    });
+    onLayoutChange(({ viewport }) => {
+      _recomputeCardGeometry(viewport.w, viewport.h);
+    });
+    _recomputeCardGeometry(window.innerWidth, window.innerHeight);
   }
   function buildTextCardContent(step) {
-    const question = step.question || "";
-    const answer = step.answer || "";
+    const question = escapeHtml(step.question || "");
+    const answer = escapeHtml(step.answer || "");
     const hasLayer1 = step.layer1_button && step.layer1_button.trim();
     const hasLayer2 = step.layer2_button && step.layer2_button.trim();
     let layerButtons = "";
     if (hasLayer1) {
-      layerButtons += `<button class="panel-trigger" data-panel="layer1" data-step="${step.step}">${step.layer1_button}</button>`;
+      layerButtons += `<button class="panel-trigger" data-panel="layer1" data-step="${step.step}">${escapeHtml(step.layer1_button)}</button>`;
     }
     if (hasLayer2) {
-      layerButtons += `<button class="panel-trigger" data-panel="layer2" data-step="${step.step}">${step.layer2_button}</button>`;
+      layerButtons += `<button class="panel-trigger" data-panel="layer2" data-step="${step.step}">${escapeHtml(step.layer2_button)}</button>`;
     }
     return `
     <div class="step-question">${question}</div>
@@ -1711,6 +2553,10 @@
         _activateTextCard(card);
         const sceneIndex = getSceneIndex(index2);
         const plate = sceneIndex >= 0 ? state.viewerPlates[sceneIndex] : null;
+        if (plate && !plate.classList.contains("is-active")) {
+          plate.style.transform = "translateY(0)";
+          plate.classList.add("is-active");
+        }
         if (plate && plate.classList.contains("video-plate")) {
           const clipStart = parseFloat(step.clip_start) || 0;
           const clipEnd = parseFloat(step.clip_end) || 0;
@@ -1727,7 +2573,6 @@
       }
     } else {
       if (needsNewViewer) {
-        const prevSceneIndex = prevObjectId !== null ? getSceneIndex(Math.max(0, index2 + 1)) : -1;
         const currentSceneIndex = getSceneIndex(index2 + 1);
         const currentPlate = currentSceneIndex >= 0 ? state.viewerPlates[currentSceneIndex] : null;
         const prevPlate = state.viewerPlates[getSceneIndex(index2)];
@@ -1851,6 +2696,11 @@
     const newPlate = sceneIndex >= 0 ? state.viewerPlates[sceneIndex] : null;
     if (!newPlate) return;
     newPlate.style.zIndex = _zPlan.plateZ[stepIndex];
+    if (prevPlate && prevPlate === newPlate) {
+      newPlate.style.transform = "translateY(0)";
+      newPlate.classList.add("is-active");
+      return;
+    }
     if (direction === "forward") {
       if (sceneIndex === 0) {
         const currentTransform = newPlate.style.transform;
@@ -1898,17 +2748,17 @@
       activateVideoCard(newPlate, sceneIndex);
     } else if (!viewerCard) {
       const zIndex = _zPlan.plateZ[stepIndex];
-      _initTifyInPlate(newPlate, objectId, sceneIndex, zIndex, x, y, zoom, page);
+      _initOsdInPlate(newPlate, objectId, sceneIndex, zIndex, x, y, zoom, page);
     } else if (viewerCard.isReady && !isNaN(x) && !isNaN(y) && !isNaN(zoom)) {
       snapIiifToPosition(viewerCard, x, y, zoom);
     } else if (!isNaN(x) && !isNaN(y) && !isNaN(zoom)) {
       viewerCard.pendingZoom = { x, y, zoom, snap: true };
     }
   }
-  function _initTifyInPlate(plateEl, objectId, sceneIndex, zIndex, x, y, zoom, page) {
+  function _initOsdInPlate(plateEl, objectId, sceneIndex, zIndex, x, y, zoom, page) {
     const manifestUrl = getManifestUrl(objectId, page);
     if (!manifestUrl) {
-      console.error("_initTifyInPlate: no manifest URL for", objectId);
+      console.error("_initOsdInPlate: no manifest URL for", objectId);
       return;
     }
     plateEl.dataset.loading = "true";
@@ -1922,11 +2772,12 @@
     } else {
       viewerDiv.id = viewerId;
     }
-    const tifyInstance = new window.Tify({
+    const startPage = page && page > 1 ? page - 1 : 0;
+    const osdWrapper = new IiifViewer({
       container: "#" + viewerId,
       manifestUrl,
-      panels: [],
-      urlQueryKey: false
+      startPage,
+      showChrome: false
     });
     const viewerCard = {
       sceneIndex,
@@ -1934,27 +2785,48 @@
       objectId,
       page: page || void 0,
       element: plateEl,
-      tifyInstance,
+      osdWrapper,
       osdViewer: null,
       isReady: false,
       pendingZoom: !isNaN(x) && !isNaN(y) && !isNaN(zoom) ? { x, y, zoom, snap: true } : null,
       zIndex
     };
-    tifyInstance.ready.then(() => {
-      viewerCard.osdViewer = tifyInstance.viewer;
+    osdWrapper.ready.then(() => {
+      viewerCard.osdViewer = osdWrapper.viewer;
       viewerCard.isReady = true;
       delete plateEl.dataset.loading;
-      tifyInstance.viewer.gestureSettingsMouse.scrollToZoom = false;
+      osdWrapper.viewer.gestureSettingsMouse.scrollToZoom = false;
       if (viewerCard.pendingZoom) {
-        if (viewerCard.pendingZoom.snap) {
-          snapIiifToPosition(viewerCard, viewerCard.pendingZoom.x, viewerCard.pendingZoom.y, viewerCard.pendingZoom.zoom);
+        const pz = viewerCard.pendingZoom;
+        if (pz.snap) {
+          snapIiifToPosition(viewerCard, pz.x, pz.y, pz.zoom);
         } else {
-          animateIiifToPosition(viewerCard, viewerCard.pendingZoom.x, viewerCard.pendingZoom.y, viewerCard.pendingZoom.zoom);
+          animateIiifToPosition(viewerCard, pz.x, pz.y, pz.zoom);
         }
+        requestAnimationFrame(() => {
+          const pzAfter = viewerCard.pendingZoom;
+          if (pzAfter && viewerCard.osdViewer) {
+            const vp = viewerCard.osdViewer.viewport;
+            const homeZoom = vp.getHomeZoom();
+            const curZoom = vp.getZoom(true);
+            const TOL = 0.05;
+            const authoredIsZoomed = pzAfter.zoom > 1.1;
+            const droppedToHome = Math.abs(curZoom - homeZoom) < homeZoom * TOL;
+            if (authoredIsZoomed && droppedToHome) {
+              if (pzAfter.snap) {
+                snapIiifToPosition(viewerCard, pzAfter.x, pzAfter.y, pzAfter.zoom);
+              } else {
+                animateIiifToPosition(viewerCard, pzAfter.x, pzAfter.y, pzAfter.zoom);
+              }
+            }
+          }
+          viewerCard.pendingZoom = null;
+        });
+      } else {
         viewerCard.pendingZoom = null;
       }
     }).catch((err) => {
-      console.error(`_initTifyInPlate: Tify failed for ${objectId}:`, err);
+      console.error(`_initOsdInPlate: IiifViewer failed for ${objectId}:`, err);
       viewerCard.isReady = true;
       delete plateEl.dataset.loading;
     });
@@ -1972,23 +2844,14 @@
         }
       }
       const evicted = state.viewerCards.splice(farthestIdx, 1)[0];
-      _evictTifyInstance(evicted);
+      _evictOsdInstance(evicted);
     }
   }
-  function _evictTifyInstance(viewerCard) {
-    if (viewerCard.osdViewer) {
-      const canvas = viewerCard.osdViewer.drawer?.canvas;
-      if (canvas) {
-        const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-        if (gl) {
-          gl.getExtension("WEBGL_lose_context")?.loseContext();
-        }
-      }
+  function _evictOsdInstance(viewerCard) {
+    if (viewerCard.osdWrapper && typeof viewerCard.osdWrapper.destroy === "function") {
+      viewerCard.osdWrapper.destroy();
     }
-    if (viewerCard.tifyInstance && typeof viewerCard.tifyInstance.destroy === "function") {
-      viewerCard.tifyInstance.destroy();
-    }
-    viewerCard.tifyInstance = null;
+    viewerCard.osdWrapper = null;
     viewerCard.osdViewer = null;
     viewerCard.isReady = false;
     const viewerInstance = viewerCard.element.querySelector(".viewer-instance");
@@ -2083,6 +2946,23 @@
     cardEl.classList.remove("is-stacked");
     cardEl.classList.add("is-active");
     cardEl.style.transform = buildTransform(messiness, "translateY(0)");
+    const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const isScrubbing = document.querySelector(".card-stack")?.classList.contains("is-scrubbing");
+    if (prefersReduced || isScrubbing) {
+      state.cardOverlayRect = cardEl.getBoundingClientRect();
+      return;
+    }
+    if (cardEl._settleHandler) {
+      cardEl.removeEventListener("transitionend", cardEl._settleHandler);
+    }
+    const onSettled = (ev) => {
+      if (ev.target !== cardEl || ev.propertyName !== "transform") return;
+      cardEl.removeEventListener("transitionend", onSettled);
+      cardEl._settleHandler = null;
+      state.cardOverlayRect = cardEl.getBoundingClientRect();
+    };
+    cardEl._settleHandler = onSettled;
+    cardEl.addEventListener("transitionend", onSettled);
   }
   function _activateTitleCardStep(index2, direction) {
     const titleCard = state.titleCards[index2];
@@ -2123,6 +3003,7 @@
     titleCard.style.transform = "translateY(0)";
     state.activeTitleCardIndex = index2;
     state.currentObjectRun = { objectId: "", runPosition: 0 };
+    state.cardOverlayRect = null;
     updateObjectCredits("");
     preloadAhead(index2, _config.preloadSteps, 2);
   }
@@ -2156,12 +3037,10 @@
       const zIndex = _zPlan.plateZ[firstStepIdx];
       if (plate.classList.contains("audio-plate")) {
         if (!plate.querySelector(".waveform-container")) {
-          console.log(`preloadAhead (audio): scene ${targetScene} / ${objectId} (step ${firstStepIdx})`);
           _initAudioInPlate(plate, objectId, targetScene, zIndex);
         }
       } else if (plate.classList.contains("video-plate")) {
         if (!plate.querySelector(".video-iframe, iframe")) {
-          console.log(`preloadAhead (video): scene ${targetScene} / ${objectId} (step ${firstStepIdx})`);
           _initVideoInPlate(plate, objectId, targetScene, zIndex);
         }
       } else {
@@ -2170,8 +3049,7 @@
         const y = parseFloat(step.y);
         const zoom = parseFloat(step.zoom);
         const page = step.page ? parseInt(step.page, 10) : void 0;
-        console.log(`preloadAhead: scene ${targetScene} / ${objectId} (step ${firstStepIdx})`);
-        _initTifyInPlate(plate, objectId, targetScene, zIndex, x, y, zoom, page);
+        _initOsdInPlate(plate, objectId, targetScene, zIndex, x, y, zoom, page);
         _prefetchTilesForScene(targetScene);
       }
     }
@@ -2193,12 +3071,10 @@
       const zIndex = _zPlan.plateZ[firstStepIdx];
       if (plate.classList.contains("audio-plate")) {
         if (!plate.querySelector(".waveform-container")) {
-          console.log(`preloadAhead (audio): scene ${targetScene} / ${objectId} (step ${firstStepIdx})`);
           _initAudioInPlate(plate, objectId, targetScene, zIndex);
         }
       } else if (plate.classList.contains("video-plate")) {
         if (!plate.querySelector(".video-iframe, iframe")) {
-          console.log(`preloadAhead (video): scene ${targetScene} / ${objectId} (step ${firstStepIdx})`);
           _initVideoInPlate(plate, objectId, targetScene, zIndex);
         }
       } else {
@@ -2207,13 +3083,14 @@
         const y = parseFloat(step.y);
         const zoom = parseFloat(step.zoom);
         const page = step.page ? parseInt(step.page, 10) : void 0;
-        console.log(`preloadAhead: scene ${targetScene} / ${objectId} (step ${firstStepIdx})`);
-        _initTifyInPlate(plate, objectId, targetScene, zIndex, x, y, zoom, page);
+        _initOsdInPlate(plate, objectId, targetScene, zIndex, x, y, zoom, page);
         _prefetchTilesForScene(targetScene);
       }
     }
   }
   function _prefetchTilesForScene(sceneIndex) {
+    if (_prefetchedScenes.has(sceneIndex)) return;
+    _prefetchedScenes.add(sceneIndex);
     const objectId = state.sceneToObject[sceneIndex];
     if (!objectId) return;
     const objData = state.objectsIndex?.[objectId];
@@ -2245,17 +3122,30 @@
     const imageH = info.height;
     const tileSize = info.tiles?.[0]?.width || 512;
     const scaleFactors = info.tiles?.[0]?.scaleFactors || [1];
-    const centreX = x * imageW;
-    const centreY = y * imageH;
     const vpW = window.innerWidth;
     const vpH = window.innerHeight;
-    const pixelsPerViewportPx = 1 / (zoom * (vpW / imageW));
-    const visibleW = vpW * pixelsPerViewportPx;
-    const visibleH = vpH * pixelsPerViewportPx;
-    const left = Math.max(0, centreX - visibleW / 2);
-    const top = Math.max(0, centreY - visibleH / 2);
-    const right = Math.min(imageW, centreX + visibleW / 2);
-    const bottom = Math.min(imageH, centreY + visibleH / 2);
+    const r = state.cardOverlayRect;
+    const cardBox = r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null;
+    const placementMode = _deriveCardPlacement(cardBox, vpW, vpH);
+    const target = computeFocalTarget(x, y, zoom, imageW, imageH, cardBox, placementMode);
+    let centreX, centreY, halfW, halfH;
+    if (target) {
+      centreX = target.focalImg.x;
+      centreY = target.focalImg.y;
+      halfW = target.diameterImg / 2;
+      halfH = target.diameterImg / 2;
+    } else {
+      const vpH2 = window.innerHeight;
+      centreX = x * imageW;
+      centreY = y * imageH;
+      const pixelsPerViewportPx = 1 / (zoom * (vpW / imageW));
+      halfW = vpW * pixelsPerViewportPx / 2;
+      halfH = vpH2 * pixelsPerViewportPx / 2;
+    }
+    const left = Math.max(0, centreX - halfW);
+    const top = Math.max(0, centreY - halfH);
+    const right = Math.min(imageW, centreX + halfW);
+    const bottom = Math.min(imageH, centreY + halfH);
     let scaleFactor = scaleFactors[0] || 1;
     for (const sf of scaleFactors) {
       const effectiveTile2 = tileSize * sf;
@@ -2286,7 +3176,7 @@
   }
 
   // node_modules/lenis/dist/lenis.mjs
-  var version = "1.3.21";
+  var version = "1.3.19";
   function clamp(min, input, max) {
     return Math.max(min, Math.min(input, max));
   }
@@ -2305,15 +3195,16 @@
     from = 0;
     to = 0;
     currentTime = 0;
+    // These are instanciated in the fromTo method
     lerp;
     duration;
     easing;
     onUpdate;
     /**
-    * Advance the animation by the given delta time
-    *
-    * @param deltaTime - The time in seconds to advance the animation
-    */
+     * Advance the animation by the given delta time
+     *
+     * @param deltaTime - The time in seconds to advance the animation
+     */
     advance(deltaTime) {
       if (!this.isRunning) return;
       let completed = false;
@@ -2333,7 +3224,9 @@
         this.value = this.to;
         completed = true;
       }
-      if (completed) this.stop();
+      if (completed) {
+        this.stop();
+      }
       this.onUpdate?.(this.value, completed);
     }
     /** Stop the animation */
@@ -2341,13 +3234,13 @@
       this.isRunning = false;
     }
     /**
-    * Set up the animation from a starting value to an ending value
-    * with optional parameters for lerping, duration, easing, and onUpdate callback
-    *
-    * @param from - The starting value
-    * @param to - The ending value
-    * @param options - Options for the animation
-    */
+     * Set up the animation from a starting value to an ending value
+     * with optional parameters for lerping, duration, easing, and onUpdate callback
+     *
+     * @param from - The starting value
+     * @param to - The ending value
+     * @param options - Options for the animation
+     */
     fromTo(from, to, { lerp: lerp2, duration, easing, onStart, onUpdate }) {
       this.from = this.value = from;
       this.to = to;
@@ -2371,20 +3264,14 @@
     };
   }
   var Dimensions = class {
-    width = 0;
-    height = 0;
-    scrollHeight = 0;
-    scrollWidth = 0;
-    debouncedResize;
-    wrapperResizeObserver;
-    contentResizeObserver;
     constructor(wrapper, content, { autoResize = true, debounce: debounceValue = 250 } = {}) {
       this.wrapper = wrapper;
       this.content = content;
       if (autoResize) {
         this.debouncedResize = debounce(this.resize, debounceValue);
-        if (this.wrapper instanceof Window) window.addEventListener("resize", this.debouncedResize);
-        else {
+        if (this.wrapper instanceof Window) {
+          window.addEventListener("resize", this.debouncedResize);
+        } else {
           this.wrapperResizeObserver = new ResizeObserver(this.debouncedResize);
           this.wrapperResizeObserver.observe(this.wrapper);
         }
@@ -2393,10 +3280,20 @@
       }
       this.resize();
     }
+    width = 0;
+    height = 0;
+    scrollHeight = 0;
+    scrollWidth = 0;
+    // These are instanciated in the constructor as they need information from the options
+    debouncedResize;
+    wrapperResizeObserver;
+    contentResizeObserver;
     destroy() {
       this.wrapperResizeObserver?.disconnect();
       this.contentResizeObserver?.disconnect();
-      if (this.wrapper === window && this.debouncedResize) window.removeEventListener("resize", this.debouncedResize);
+      if (this.wrapper === window && this.debouncedResize) {
+        window.removeEventListener("resize", this.debouncedResize);
+      }
     }
     resize = () => {
       this.onWrapperResize();
@@ -2430,38 +3327,43 @@
   var Emitter = class {
     events = {};
     /**
-    * Emit an event with the given data
-    * @param event Event name
-    * @param args Data to pass to the event handlers
-    */
+     * Emit an event with the given data
+     * @param event Event name
+     * @param args Data to pass to the event handlers
+     */
     emit(event, ...args) {
       const callbacks = this.events[event] || [];
-      for (let i = 0, length = callbacks.length; i < length; i++) callbacks[i]?.(...args);
+      for (let i = 0, length = callbacks.length; i < length; i++) {
+        callbacks[i]?.(...args);
+      }
     }
     /**
-    * Add a callback to the event
-    * @param event Event name
-    * @param cb Callback function
-    * @returns Unsubscribe function
-    */
+     * Add a callback to the event
+     * @param event Event name
+     * @param cb Callback function
+     * @returns Unsubscribe function
+     */
     on(event, cb) {
-      if (this.events[event]) this.events[event].push(cb);
-      else this.events[event] = [cb];
+      if (this.events[event]) {
+        this.events[event].push(cb);
+      } else {
+        this.events[event] = [cb];
+      }
       return () => {
         this.events[event] = this.events[event]?.filter((i) => cb !== i);
       };
     }
     /**
-    * Remove a callback from the event
-    * @param event Event name
-    * @param callback Callback function
-    */
+     * Remove a callback from the event
+     * @param event Event name
+     * @param callback Callback function
+     */
     off(event, callback) {
       this.events[event] = this.events[event]?.filter((i) => callback !== i);
     }
     /**
-    * Remove all event listeners and clean up
-    */
+     * Remove all event listeners and clean up
+     */
     destroy() {
       this.events = {};
     }
@@ -2474,6 +3376,24 @@
     return 1;
   }
   var VirtualScroll = class {
+    constructor(element, options = { wheelMultiplier: 1, touchMultiplier: 1 }) {
+      this.element = element;
+      this.options = options;
+      window.addEventListener("resize", this.onWindowResize);
+      this.onWindowResize();
+      this.element.addEventListener("wheel", this.onWheel, listenerOptions);
+      this.element.addEventListener(
+        "touchstart",
+        this.onTouchStart,
+        listenerOptions
+      );
+      this.element.addEventListener(
+        "touchmove",
+        this.onTouchMove,
+        listenerOptions
+      );
+      this.element.addEventListener("touchend", this.onTouchEnd, listenerOptions);
+    }
     touchStart = {
       x: 0,
       y: 0
@@ -2487,25 +3407,12 @@
       height: 0
     };
     emitter = new Emitter();
-    constructor(element, options = {
-      wheelMultiplier: 1,
-      touchMultiplier: 1
-    }) {
-      this.element = element;
-      this.options = options;
-      window.addEventListener("resize", this.onWindowResize);
-      this.onWindowResize();
-      this.element.addEventListener("wheel", this.onWheel, listenerOptions);
-      this.element.addEventListener("touchstart", this.onTouchStart, listenerOptions);
-      this.element.addEventListener("touchmove", this.onTouchMove, listenerOptions);
-      this.element.addEventListener("touchend", this.onTouchEnd, listenerOptions);
-    }
     /**
-    * Add an event listener for the given event and callback
-    *
-    * @param event Event name
-    * @param callback Callback function
-    */
+     * Add an event listener for the given event and callback
+     *
+     * @param event Event name
+     * @param callback Callback function
+     */
     on(event, callback) {
       return this.emitter.on(event, callback);
     }
@@ -2514,15 +3421,27 @@
       this.emitter.destroy();
       window.removeEventListener("resize", this.onWindowResize);
       this.element.removeEventListener("wheel", this.onWheel, listenerOptions);
-      this.element.removeEventListener("touchstart", this.onTouchStart, listenerOptions);
-      this.element.removeEventListener("touchmove", this.onTouchMove, listenerOptions);
-      this.element.removeEventListener("touchend", this.onTouchEnd, listenerOptions);
+      this.element.removeEventListener(
+        "touchstart",
+        this.onTouchStart,
+        listenerOptions
+      );
+      this.element.removeEventListener(
+        "touchmove",
+        this.onTouchMove,
+        listenerOptions
+      );
+      this.element.removeEventListener(
+        "touchend",
+        this.onTouchEnd,
+        listenerOptions
+      );
     }
     /**
-    * Event handler for 'touchstart' event
-    *
-    * @param event Touch event
-    */
+     * Event handler for 'touchstart' event
+     *
+     * @param event Touch event
+     */
     onTouchStart = (event) => {
       const { clientX, clientY } = event.targetTouches ? event.targetTouches[0] : event;
       this.touchStart.x = clientX;
@@ -2570,11 +3489,7 @@
       deltaY *= multiplierY;
       deltaX *= this.options.wheelMultiplier;
       deltaY *= this.options.wheelMultiplier;
-      this.emitter.emit("scroll", {
-        deltaX,
-        deltaY,
-        event
-      });
+      this.emitter.emit("scroll", { deltaX, deltaY, event });
     };
     onWindowResize = () => {
       this.window = {
@@ -2586,67 +3501,115 @@
   var defaultEasing = (t) => Math.min(1, 1.001 - 2 ** (-10 * t));
   var Lenis = class {
     _isScrolling = false;
+    // true when scroll is animating
     _isStopped = false;
+    // true if user should not be able to scroll - enable/disable programmatically
     _isLocked = false;
+    // same as isStopped but enabled/disabled when scroll reaches target
     _preventNextNativeScrollEvent = false;
     _resetVelocityTimeout = null;
     _rafId = null;
     /**
-    * Whether or not the user is touching the screen
-    */
+     * Whether or not the user is touching the screen
+     */
     isTouching;
     /**
-    * The time in ms since the lenis instance was created
-    */
+     * The time in ms since the lenis instance was created
+     */
     time = 0;
     /**
-    * User data that will be forwarded through the scroll event
-    *
-    * @example
-    * lenis.scrollTo(100, {
-    *   userData: {
-    *     foo: 'bar'
-    *   }
-    * })
-    */
+     * User data that will be forwarded through the scroll event
+     *
+     * @example
+     * lenis.scrollTo(100, {
+     *   userData: {
+     *     foo: 'bar'
+     *   }
+     * })
+     */
     userData = {};
     /**
-    * The last velocity of the scroll
-    */
+     * The last velocity of the scroll
+     */
     lastVelocity = 0;
     /**
-    * The current velocity of the scroll
-    */
+     * The current velocity of the scroll
+     */
     velocity = 0;
     /**
-    * The direction of the scroll
-    */
+     * The direction of the scroll
+     */
     direction = 0;
     /**
-    * The options passed to the lenis instance
-    */
+     * The options passed to the lenis instance
+     */
     options;
     /**
-    * The target scroll value
-    */
+     * The target scroll value
+     */
     targetScroll;
     /**
-    * The animated scroll value
-    */
+     * The animated scroll value
+     */
     animatedScroll;
+    // These are instanciated here as they don't need information from the options
     animate = new Animate();
     emitter = new Emitter();
+    // These are instanciated in the constructor as they need information from the options
     dimensions;
+    // This is not private because it's used in the Snap class
     virtualScroll;
-    constructor({ wrapper = window, content = document.documentElement, eventsTarget = wrapper, smoothWheel = true, syncTouch = false, syncTouchLerp = 0.075, touchInertiaExponent = 1.7, duration, easing, lerp: lerp2 = 0.1, infinite = false, orientation = "vertical", gestureOrientation = orientation === "horizontal" ? "both" : "vertical", touchMultiplier = 1, wheelMultiplier = 1, autoResize = true, prevent, virtualScroll, overscroll = true, autoRaf = false, anchors = false, autoToggle = false, allowNestedScroll = false, __experimental__naiveDimensions = false, naiveDimensions = __experimental__naiveDimensions, stopInertiaOnNavigate = false } = {}) {
+    constructor({
+      wrapper = window,
+      content = document.documentElement,
+      eventsTarget = wrapper,
+      smoothWheel = true,
+      syncTouch = false,
+      syncTouchLerp = 0.075,
+      touchInertiaExponent = 1.7,
+      duration,
+      // in seconds
+      easing,
+      lerp: lerp2 = 0.1,
+      infinite = false,
+      orientation = "vertical",
+      // vertical, horizontal
+      gestureOrientation = orientation === "horizontal" ? "both" : "vertical",
+      // vertical, horizontal, both
+      touchMultiplier = 1,
+      wheelMultiplier = 1,
+      autoResize = true,
+      prevent,
+      virtualScroll,
+      overscroll = true,
+      autoRaf = false,
+      anchors = false,
+      autoToggle = false,
+      // https://caniuse.com/?search=transition-behavior
+      allowNestedScroll = false,
+      __experimental__naiveDimensions = false,
+      naiveDimensions = __experimental__naiveDimensions,
+      stopInertiaOnNavigate = false
+    } = {}) {
       window.lenisVersion = version;
-      if (!window.lenis) window.lenis = {};
+      if (!window.lenis) {
+        window.lenis = {};
+      }
       window.lenis.version = version;
-      if (orientation === "horizontal") window.lenis.horizontal = true;
-      if (syncTouch === true) window.lenis.touch = true;
-      if (!wrapper || wrapper === document.documentElement) wrapper = window;
-      if (typeof duration === "number" && typeof easing !== "function") easing = defaultEasing;
-      else if (typeof easing === "function" && typeof duration !== "number") duration = 1;
+      if (orientation === "horizontal") {
+        window.lenis.horizontal = true;
+      }
+      if (syncTouch === true) {
+        window.lenis.touch = true;
+      }
+      if (!wrapper || wrapper === document.documentElement) {
+        wrapper = window;
+      }
+      if (typeof duration === "number" && typeof easing !== "function") {
+        easing = defaultEasing;
+      } else if (typeof easing === "function" && typeof duration !== "number") {
+        duration = 1;
+      }
       this.options = {
         wrapper,
         content,
@@ -2678,9 +3641,19 @@
       this.updateClassName();
       this.targetScroll = this.animatedScroll = this.actualScroll;
       this.options.wrapper.addEventListener("scroll", this.onNativeScroll);
-      this.options.wrapper.addEventListener("scrollend", this.onScrollEnd, { capture: true });
-      if (this.options.anchors || this.options.stopInertiaOnNavigate) this.options.wrapper.addEventListener("click", this.onClick);
-      this.options.wrapper.addEventListener("pointerdown", this.onPointerDown);
+      this.options.wrapper.addEventListener("scrollend", this.onScrollEnd, {
+        capture: true
+      });
+      if (this.options.anchors || this.options.stopInertiaOnNavigate) {
+        this.options.wrapper.addEventListener(
+          "click",
+          this.onClick
+        );
+      }
+      this.options.wrapper.addEventListener(
+        "pointerdown",
+        this.onPointerDown
+      );
       this.virtualScroll = new VirtualScroll(eventsTarget, {
         touchMultiplier,
         wheelMultiplier
@@ -2690,21 +3663,35 @@
         this.checkOverflow();
         this.rootElement.addEventListener("transitionend", this.onTransitionEnd);
       }
-      if (this.options.autoRaf) this._rafId = requestAnimationFrame(this.raf);
+      if (this.options.autoRaf) {
+        this._rafId = requestAnimationFrame(this.raf);
+      }
     }
     /**
-    * Destroy the lenis instance, remove all event listeners and clean up the class name
-    */
+     * Destroy the lenis instance, remove all event listeners and clean up the class name
+     */
     destroy() {
       this.emitter.destroy();
       this.options.wrapper.removeEventListener("scroll", this.onNativeScroll);
-      this.options.wrapper.removeEventListener("scrollend", this.onScrollEnd, { capture: true });
-      this.options.wrapper.removeEventListener("pointerdown", this.onPointerDown);
-      if (this.options.anchors || this.options.stopInertiaOnNavigate) this.options.wrapper.removeEventListener("click", this.onClick);
+      this.options.wrapper.removeEventListener("scrollend", this.onScrollEnd, {
+        capture: true
+      });
+      this.options.wrapper.removeEventListener(
+        "pointerdown",
+        this.onPointerDown
+      );
+      if (this.options.anchors || this.options.stopInertiaOnNavigate) {
+        this.options.wrapper.removeEventListener(
+          "click",
+          this.onClick
+        );
+      }
       this.virtualScroll.destroy();
       this.dimensions.destroy();
       this.cleanUpClassName();
-      if (this._rafId) cancelAnimationFrame(this._rafId);
+      if (this._rafId) {
+        cancelAnimationFrame(this._rafId);
+      }
     }
     on(event, callback) {
       return this.emitter.on(event, callback);
@@ -2714,41 +3701,58 @@
     }
     onScrollEnd = (e) => {
       if (!(e instanceof CustomEvent)) {
-        if (this.isScrolling === "smooth" || this.isScrolling === false) e.stopPropagation();
+        if (this.isScrolling === "smooth" || this.isScrolling === false) {
+          e.stopPropagation();
+        }
       }
     };
     dispatchScrollendEvent = () => {
-      this.options.wrapper.dispatchEvent(new CustomEvent("scrollend", {
-        bubbles: this.options.wrapper === window,
-        detail: { lenisScrollEnd: true }
-      }));
+      this.options.wrapper.dispatchEvent(
+        new CustomEvent("scrollend", {
+          bubbles: this.options.wrapper === window,
+          // cancelable: false,
+          detail: {
+            lenisScrollEnd: true
+          }
+        })
+      );
     };
     get overflow() {
       const property = this.isHorizontal ? "overflow-x" : "overflow-y";
       return getComputedStyle(this.rootElement)[property];
     }
     checkOverflow() {
-      if (["hidden", "clip"].includes(this.overflow)) this.internalStop();
-      else this.internalStart();
+      if (["hidden", "clip"].includes(this.overflow)) {
+        this.internalStop();
+      } else {
+        this.internalStart();
+      }
     }
     onTransitionEnd = (event) => {
-      if (event.propertyName?.includes("overflow") && event.target === this.rootElement) this.checkOverflow();
+      if (event.propertyName.includes("overflow")) {
+        this.checkOverflow();
+      }
     };
     setScroll(scroll) {
-      if (this.isHorizontal) this.options.wrapper.scrollTo({
-        left: scroll,
-        behavior: "instant"
-      });
-      else this.options.wrapper.scrollTo({
-        top: scroll,
-        behavior: "instant"
-      });
+      if (this.isHorizontal) {
+        this.options.wrapper.scrollTo({ left: scroll, behavior: "instant" });
+      } else {
+        this.options.wrapper.scrollTo({ top: scroll, behavior: "instant" });
+      }
     }
     onClick = (event) => {
-      const linkElementsUrls = event.composedPath().filter((node) => node instanceof HTMLAnchorElement && node.href).map((element) => new URL(element.href));
+      const path = event.composedPath();
+      const linkElements = path.filter(
+        (node) => node instanceof HTMLAnchorElement && node.href
+      );
+      const linkElementsUrls = linkElements.map(
+        (element) => new URL(element.href)
+      );
       const currentUrl = new URL(window.location.href);
       if (this.options.anchors) {
-        const anchorElementUrl = linkElementsUrls.find((targetUrl) => currentUrl.host === targetUrl.host && currentUrl.pathname === targetUrl.pathname && targetUrl.hash);
+        const anchorElementUrl = linkElementsUrls.find(
+          (targetUrl) => currentUrl.host === targetUrl.host && currentUrl.pathname === targetUrl.pathname && targetUrl.hash
+        );
         if (anchorElementUrl) {
           const options = typeof this.options.anchors === "object" && this.options.anchors ? this.options.anchors : void 0;
           const target = `#${anchorElementUrl.hash.split("#")[1]}`;
@@ -2757,64 +3761,87 @@
         }
       }
       if (this.options.stopInertiaOnNavigate) {
-        if (linkElementsUrls.some((targetUrl) => currentUrl.host === targetUrl.host && currentUrl.pathname !== targetUrl.pathname)) {
+        const hasPageLinkElementUrl = linkElementsUrls.some(
+          (targetUrl) => currentUrl.host === targetUrl.host && currentUrl.pathname !== targetUrl.pathname
+        );
+        if (hasPageLinkElementUrl) {
           this.reset();
           return;
         }
       }
     };
     onPointerDown = (event) => {
-      if (event.button === 1) this.reset();
+      if (event.button === 1) {
+        this.reset();
+      }
     };
     onVirtualScroll = (data) => {
-      if (typeof this.options.virtualScroll === "function" && this.options.virtualScroll(data) === false) return;
+      if (typeof this.options.virtualScroll === "function" && this.options.virtualScroll(data) === false)
+        return;
       const { deltaX, deltaY, event } = data;
-      this.emitter.emit("virtual-scroll", {
-        deltaX,
-        deltaY,
-        event
-      });
+      this.emitter.emit("virtual-scroll", { deltaX, deltaY, event });
       if (event.ctrlKey) return;
       if (event.lenisStopPropagation) return;
       const isTouch = event.type.includes("touch");
       const isWheel = event.type.includes("wheel");
       this.isTouching = event.type === "touchstart" || event.type === "touchmove";
       const isClickOrTap = deltaX === 0 && deltaY === 0;
-      if (this.options.syncTouch && isTouch && event.type === "touchstart" && isClickOrTap && !this.isStopped && !this.isLocked) {
+      const isTapToStop = this.options.syncTouch && isTouch && event.type === "touchstart" && isClickOrTap && !this.isStopped && !this.isLocked;
+      if (isTapToStop) {
         this.reset();
         return;
       }
       const isUnknownGesture = this.options.gestureOrientation === "vertical" && deltaY === 0 || this.options.gestureOrientation === "horizontal" && deltaX === 0;
-      if (isClickOrTap || isUnknownGesture) return;
+      if (isClickOrTap || isUnknownGesture) {
+        return;
+      }
       let composedPath = event.composedPath();
       composedPath = composedPath.slice(0, composedPath.indexOf(this.rootElement));
       const prevent = this.options.prevent;
       const gestureOrientation = Math.abs(deltaX) >= Math.abs(deltaY) ? "horizontal" : "vertical";
-      if (composedPath.find((node) => node instanceof HTMLElement && (typeof prevent === "function" && prevent?.(node) || node.hasAttribute?.("data-lenis-prevent") || gestureOrientation === "vertical" && node.hasAttribute?.("data-lenis-prevent-vertical") || gestureOrientation === "horizontal" && node.hasAttribute?.("data-lenis-prevent-horizontal") || isTouch && node.hasAttribute?.("data-lenis-prevent-touch") || isWheel && node.hasAttribute?.("data-lenis-prevent-wheel") || this.options.allowNestedScroll && this.hasNestedScroll(node, {
-        deltaX,
-        deltaY
-      })))) return;
+      if (composedPath.find(
+        (node) => node instanceof HTMLElement && (typeof prevent === "function" && prevent?.(node) || node.hasAttribute?.("data-lenis-prevent") || gestureOrientation === "vertical" && node.hasAttribute?.("data-lenis-prevent-vertical") || gestureOrientation === "horizontal" && node.hasAttribute?.("data-lenis-prevent-horizontal") || isTouch && node.hasAttribute?.("data-lenis-prevent-touch") || isWheel && node.hasAttribute?.("data-lenis-prevent-wheel") || this.options.allowNestedScroll && this.hasNestedScroll(node, {
+          deltaX,
+          deltaY
+        }))
+      ))
+        return;
       if (this.isStopped || this.isLocked) {
-        if (event.cancelable) event.preventDefault();
+        if (event.cancelable) {
+          event.preventDefault();
+        }
         return;
       }
-      if (!(this.options.syncTouch && isTouch || this.options.smoothWheel && isWheel)) {
+      const isSmooth = this.options.syncTouch && isTouch || this.options.smoothWheel && isWheel;
+      if (!isSmooth) {
         this.isScrolling = "native";
         this.animate.stop();
         event.lenisStopPropagation = true;
         return;
       }
       let delta = deltaY;
-      if (this.options.gestureOrientation === "both") delta = Math.abs(deltaY) > Math.abs(deltaX) ? deltaY : deltaX;
-      else if (this.options.gestureOrientation === "horizontal") delta = deltaX;
-      if (!this.options.overscroll || this.options.infinite || this.options.wrapper !== window && this.limit > 0 && (this.animatedScroll > 0 && this.animatedScroll < this.limit || this.animatedScroll === 0 && deltaY > 0 || this.animatedScroll === this.limit && deltaY < 0)) event.lenisStopPropagation = true;
-      if (event.cancelable) event.preventDefault();
+      if (this.options.gestureOrientation === "both") {
+        delta = Math.abs(deltaY) > Math.abs(deltaX) ? deltaY : deltaX;
+      } else if (this.options.gestureOrientation === "horizontal") {
+        delta = deltaX;
+      }
+      if (!this.options.overscroll || this.options.infinite || this.options.wrapper !== window && this.limit > 0 && (this.animatedScroll > 0 && this.animatedScroll < this.limit || this.animatedScroll === 0 && deltaY > 0 || this.animatedScroll === this.limit && deltaY < 0)) {
+        event.lenisStopPropagation = true;
+      }
+      if (event.cancelable) {
+        event.preventDefault();
+      }
       const isSyncTouch = isTouch && this.options.syncTouch;
-      const hasTouchInertia = isTouch && event.type === "touchend";
-      if (hasTouchInertia) delta = Math.sign(this.velocity) * Math.abs(this.velocity) ** this.options.touchInertiaExponent;
+      const isTouchEnd = isTouch && event.type === "touchend";
+      const hasTouchInertia = isTouchEnd;
+      if (hasTouchInertia) {
+        delta = Math.sign(this.velocity) * Math.abs(this.velocity) ** this.options.touchInertiaExponent;
+      }
       this.scrollTo(this.targetScroll + delta, {
         programmatic: false,
-        ...isSyncTouch ? { lerp: hasTouchInertia ? this.options.syncTouchLerp : 1 } : {
+        ...isSyncTouch ? {
+          lerp: hasTouchInertia ? this.options.syncTouchLerp : 1
+        } : {
           lerp: this.options.lerp,
           duration: this.options.duration,
           easing: this.options.easing
@@ -2822,8 +3849,8 @@
       });
     };
     /**
-    * Force lenis to recalculate the dimensions
-    */
+     * Force lenis to recalculate the dimensions
+     */
     resize() {
       this.dimensions.resize();
       this.animatedScroll = this.targetScroll = this.actualScroll;
@@ -2846,15 +3873,21 @@
         this.animatedScroll = this.targetScroll = this.actualScroll;
         this.lastVelocity = this.velocity;
         this.velocity = this.animatedScroll - lastScroll;
-        this.direction = Math.sign(this.animatedScroll - lastScroll);
-        if (!this.isStopped) this.isScrolling = "native";
+        this.direction = Math.sign(
+          this.animatedScroll - lastScroll
+        );
+        if (!this.isStopped) {
+          this.isScrolling = "native";
+        }
         this.emit();
-        if (this.velocity !== 0) this._resetVelocityTimeout = setTimeout(() => {
-          this.lastVelocity = this.velocity;
-          this.velocity = 0;
-          this.isScrolling = false;
-          this.emit();
-        }, 400);
+        if (this.velocity !== 0) {
+          this._resetVelocityTimeout = setTimeout(() => {
+            this.lastVelocity = this.velocity;
+            this.velocity = 0;
+            this.isScrolling = false;
+            this.emit();
+          }, 400);
+        }
       }
     };
     reset() {
@@ -2865,8 +3898,8 @@
       this.animate.stop();
     }
     /**
-    * Start lenis scroll after it has been stopped
-    */
+     * Start lenis scroll after it has been stopped
+     */
     start() {
       if (!this.isStopped) return;
       if (this.options.autoToggle) {
@@ -2882,8 +3915,8 @@
       this.emit();
     }
     /**
-    * Stop lenis scroll
-    */
+     * Stop lenis scroll
+     */
     stop() {
       if (this.isStopped) return;
       if (this.options.autoToggle) {
@@ -2899,69 +3932,81 @@
       this.emit();
     }
     /**
-    * RequestAnimationFrame for lenis
-    *
-    * @param time The time in ms from an external clock like `requestAnimationFrame` or Tempus
-    */
+     * RequestAnimationFrame for lenis
+     *
+     * @param time The time in ms from an external clock like `requestAnimationFrame` or Tempus
+     */
     raf = (time) => {
       const deltaTime = time - (this.time || time);
       this.time = time;
       this.animate.advance(deltaTime * 1e-3);
-      if (this.options.autoRaf) this._rafId = requestAnimationFrame(this.raf);
+      if (this.options.autoRaf) {
+        this._rafId = requestAnimationFrame(this.raf);
+      }
     };
     /**
-    * Scroll to a target value
-    *
-    * @param target The target value to scroll to
-    * @param options The options for the scroll
-    *
-    * @example
-    * lenis.scrollTo(100, {
-    *   offset: 100,
-    *   duration: 1,
-    *   easing: (t) => 1 - Math.cos((t * Math.PI) / 2),
-    *   lerp: 0.1,
-    *   onStart: () => {
-    *     console.log('onStart')
-    *   },
-    *   onComplete: () => {
-    *     console.log('onComplete')
-    *   },
-    * })
-    */
-    scrollTo(_target, { offset = 0, immediate = false, lock = false, programmatic = true, lerp: lerp2 = programmatic ? this.options.lerp : void 0, duration = programmatic ? this.options.duration : void 0, easing = programmatic ? this.options.easing : void 0, onStart, onComplete, force = false, userData } = {}) {
+     * Scroll to a target value
+     *
+     * @param target The target value to scroll to
+     * @param options The options for the scroll
+     *
+     * @example
+     * lenis.scrollTo(100, {
+     *   offset: 100,
+     *   duration: 1,
+     *   easing: (t) => 1 - Math.cos((t * Math.PI) / 2),
+     *   lerp: 0.1,
+     *   onStart: () => {
+     *     console.log('onStart')
+     *   },
+     *   onComplete: () => {
+     *     console.log('onComplete')
+     *   },
+     * })
+     */
+    scrollTo(_target, {
+      offset = 0,
+      immediate = false,
+      lock = false,
+      programmatic = true,
+      // called from outside of the class
+      lerp: lerp2 = programmatic ? this.options.lerp : void 0,
+      duration = programmatic ? this.options.duration : void 0,
+      easing = programmatic ? this.options.easing : void 0,
+      onStart,
+      onComplete,
+      force = false,
+      // scroll even if stopped
+      userData
+    } = {}) {
       if ((this.isStopped || this.isLocked) && !force) return;
       let target = _target;
       let adjustedOffset = offset;
-      if (typeof target === "string" && [
-        "top",
-        "left",
-        "start",
-        "#"
-      ].includes(target)) target = 0;
-      else if (typeof target === "string" && [
-        "bottom",
-        "right",
-        "end"
-      ].includes(target)) target = this.limit;
-      else {
+      if (typeof target === "string" && ["top", "left", "start", "#"].includes(target)) {
+        target = 0;
+      } else if (typeof target === "string" && ["bottom", "right", "end"].includes(target)) {
+        target = this.limit;
+      } else {
         let node = null;
         if (typeof target === "string") {
           node = document.querySelector(target);
-          if (!node) if (target === "#top") target = 0;
-          else console.warn("Lenis: Target not found", target);
-        } else if (target instanceof HTMLElement && target?.nodeType) node = target;
+          if (!node) {
+            if (target === "#top") {
+              target = 0;
+            } else {
+              console.warn("Lenis: Target not found", target);
+            }
+          }
+        } else if (target instanceof HTMLElement && target?.nodeType) {
+          node = target;
+        }
         if (node) {
           if (this.options.wrapper !== window) {
             const wrapperRect = this.rootElement.getBoundingClientRect();
             adjustedOffset -= this.isHorizontal ? wrapperRect.left : wrapperRect.top;
           }
           const rect = node.getBoundingClientRect();
-          const targetStyle = getComputedStyle(node);
-          const scrollMargin = this.isHorizontal ? Number.parseFloat(targetStyle.scrollMarginLeft) : Number.parseFloat(targetStyle.scrollMarginTop);
-          const containerStyle = getComputedStyle(this.rootElement);
-          const scrollPadding = this.isHorizontal ? Number.parseFloat(containerStyle.scrollPaddingLeft) : Number.parseFloat(containerStyle.scrollPaddingTop);
-          target = (this.isHorizontal ? rect.left : rect.top) + this.animatedScroll - (Number.isNaN(scrollMargin) ? 0 : scrollMargin) - (Number.isNaN(scrollPadding) ? 0 : scrollPadding);
+          target = (this.isHorizontal ? rect.left : rect.top) + this.animatedScroll;
         }
       }
       if (typeof target !== "number") return;
@@ -2971,10 +4016,15 @@
         if (programmatic) {
           this.targetScroll = this.animatedScroll = this.scroll;
           const distance = target - this.animatedScroll;
-          if (distance > this.limit / 2) target -= this.limit;
-          else if (distance < -this.limit / 2) target += this.limit;
+          if (distance > this.limit / 2) {
+            target -= this.limit;
+          } else if (distance < -this.limit / 2) {
+            target += this.limit;
+          }
         }
-      } else target = clamp(0, target, this.limit);
+      } else {
+        target = clamp(0, target, this.limit);
+      }
       if (target === this.targetScroll) {
         onStart?.(this);
         onComplete?.(this);
@@ -2994,9 +4044,14 @@
         });
         return;
       }
-      if (!programmatic) this.targetScroll = target;
-      if (typeof duration === "number" && typeof easing !== "function") easing = defaultEasing;
-      else if (typeof easing === "function" && typeof duration !== "number") duration = 1;
+      if (!programmatic) {
+        this.targetScroll = target;
+      }
+      if (typeof duration === "number" && typeof easing !== "function") {
+        easing = defaultEasing;
+      } else if (typeof easing === "function" && typeof duration !== "number") {
+        duration = 1;
+      }
       this.animate.fromTo(this.animatedScroll, target, {
         duration,
         easing,
@@ -3013,7 +4068,9 @@
           this.direction = Math.sign(this.velocity);
           this.animatedScroll = value;
           this.setScroll(this.scroll);
-          if (programmatic) this.targetScroll = value;
+          if (programmatic) {
+            this.targetScroll = value;
+          }
           if (!completed) this.emit();
           if (completed) {
             this.reset();
@@ -3052,18 +4109,18 @@
         cache.time = Date.now();
         const computedStyle = window.getComputedStyle(node);
         cache.computedStyle = computedStyle;
-        hasOverflowX = [
-          "auto",
-          "overlay",
-          "scroll"
-        ].includes(computedStyle.overflowX);
-        hasOverflowY = [
-          "auto",
-          "overlay",
-          "scroll"
-        ].includes(computedStyle.overflowY);
-        hasOverscrollBehaviorX = ["auto"].includes(computedStyle.overscrollBehaviorX);
-        hasOverscrollBehaviorY = ["auto"].includes(computedStyle.overscrollBehaviorY);
+        hasOverflowX = ["auto", "overlay", "scroll"].includes(
+          computedStyle.overflowX
+        );
+        hasOverflowY = ["auto", "overlay", "scroll"].includes(
+          computedStyle.overflowY
+        );
+        hasOverscrollBehaviorX = ["auto"].includes(
+          computedStyle.overscrollBehaviorX
+        );
+        hasOverscrollBehaviorY = ["auto"].includes(
+          computedStyle.overscrollBehaviorY
+        );
         cache.hasOverflowX = hasOverflowX;
         cache.hasOverflowY = hasOverflowY;
         if (!(hasOverflowX || hasOverflowY)) return false;
@@ -3093,7 +4150,9 @@
         hasOverscrollBehaviorX = cache.hasOverscrollBehaviorX;
         hasOverscrollBehaviorY = cache.hasOverscrollBehaviorY;
       }
-      if (!(hasOverflowX && isScrollableX || hasOverflowY && isScrollableY)) return false;
+      if (!(hasOverflowX && isScrollableX || hasOverflowY && isScrollableY)) {
+        return false;
+      }
       const orientation = Math.abs(deltaX) >= Math.abs(deltaY) ? "horizontal" : "vertical";
       let scroll;
       let maxScroll;
@@ -3115,54 +4174,61 @@
         hasOverflow = hasOverflowY;
         isScrollable = isScrollableY;
         hasOverscrollBehavior = hasOverscrollBehaviorY;
-      } else return false;
-      if (!hasOverscrollBehavior && (scroll >= maxScroll || scroll <= 0)) return true;
-      return (delta > 0 ? scroll < maxScroll : scroll > 0) && hasOverflow && isScrollable;
+      } else {
+        return false;
+      }
+      if (!hasOverscrollBehavior && (scroll >= maxScroll || scroll <= 0)) {
+        return true;
+      }
+      const willScroll = delta > 0 ? scroll < maxScroll : scroll > 0;
+      return willScroll && hasOverflow && isScrollable;
     }
     /**
-    * The root element on which lenis is instanced
-    */
+     * The root element on which lenis is instanced
+     */
     get rootElement() {
       return this.options.wrapper === window ? document.documentElement : this.options.wrapper;
     }
     /**
-    * The limit which is the maximum scroll value
-    */
+     * The limit which is the maximum scroll value
+     */
     get limit() {
       if (this.options.naiveDimensions) {
-        if (this.isHorizontal) return this.rootElement.scrollWidth - this.rootElement.clientWidth;
+        if (this.isHorizontal) {
+          return this.rootElement.scrollWidth - this.rootElement.clientWidth;
+        }
         return this.rootElement.scrollHeight - this.rootElement.clientHeight;
       }
       return this.dimensions.limit[this.isHorizontal ? "x" : "y"];
     }
     /**
-    * Whether or not the scroll is horizontal
-    */
+     * Whether or not the scroll is horizontal
+     */
     get isHorizontal() {
       return this.options.orientation === "horizontal";
     }
     /**
-    * The actual scroll value
-    */
+     * The actual scroll value
+     */
     get actualScroll() {
       const wrapper = this.options.wrapper;
       return this.isHorizontal ? wrapper.scrollX ?? wrapper.scrollLeft : wrapper.scrollY ?? wrapper.scrollTop;
     }
     /**
-    * The current scroll value
-    */
+     * The current scroll value
+     */
     get scroll() {
       return this.options.infinite ? modulo(this.animatedScroll, this.limit) : this.animatedScroll;
     }
     /**
-    * The progress of the scroll relative to the limit
-    */
+     * The progress of the scroll relative to the limit
+     */
     get progress() {
       return this.limit === 0 ? 1 : this.scroll / this.limit;
     }
     /**
-    * Current scroll state
-    */
+     * Current scroll state
+     */
     get isScrolling() {
       return this._isScrolling;
     }
@@ -3173,8 +4239,8 @@
       }
     }
     /**
-    * Check if lenis is stopped
-    */
+     * Check if lenis is stopped
+     */
     get isStopped() {
       return this._isStopped;
     }
@@ -3185,8 +4251,8 @@
       }
     }
     /**
-    * Check if lenis is locked
-    */
+     * Check if lenis is locked
+     */
     get isLocked() {
       return this._isLocked;
     }
@@ -3197,14 +4263,14 @@
       }
     }
     /**
-    * Check if lenis is smooth scrolling
-    */
+     * Check if lenis is smooth scrolling
+     */
     get isSmooth() {
       return this.isScrolling === "smooth";
     }
     /**
-    * The class name applied to the wrapper element
-    */
+     * The class name applied to the wrapper element
+     */
     get className() {
       let className = "lenis";
       if (this.options.autoToggle) className += " lenis-autoToggle";
@@ -3235,54 +4301,69 @@
     };
   }
   function removeParentSticky(element) {
-    if (getComputedStyle(element).position === "sticky") {
+    const position = getComputedStyle(element).position;
+    const isSticky = position === "sticky";
+    if (isSticky) {
       element.style.setProperty("position", "static");
       element.dataset.sticky = "true";
     }
-    if (element.offsetParent) removeParentSticky(element.offsetParent);
+    if (element.offsetParent) {
+      removeParentSticky(element.offsetParent);
+    }
   }
   function addParentSticky(element) {
     if (element?.dataset?.sticky === "true") {
       element.style.removeProperty("position");
       delete element.dataset.sticky;
     }
-    if (element.offsetParent) addParentSticky(element.offsetParent);
+    if (element.offsetParent) {
+      addParentSticky(element.offsetParent);
+    }
   }
   function offsetTop(element, accumulator = 0) {
     const top = accumulator + element.offsetTop;
-    if (element.offsetParent) return offsetTop(element.offsetParent, top);
+    if (element.offsetParent) {
+      return offsetTop(element.offsetParent, top);
+    }
     return top;
   }
   function offsetLeft(element, accumulator = 0) {
     const left = accumulator + element.offsetLeft;
-    if (element.offsetParent) return offsetLeft(element.offsetParent, left);
+    if (element.offsetParent) {
+      return offsetLeft(element.offsetParent, left);
+    }
     return left;
   }
   function scrollTop(element, accumulator = 0) {
     const top = accumulator + element.scrollTop;
-    if (element.offsetParent) return scrollTop(element.offsetParent, top);
+    if (element.offsetParent) {
+      return scrollTop(element.offsetParent, top);
+    }
     return top + window.scrollY;
   }
   function scrollLeft(element, accumulator = 0) {
     const left = accumulator + element.scrollLeft;
-    if (element.offsetParent) return scrollLeft(element.offsetParent, left);
+    if (element.offsetParent) {
+      return scrollLeft(element.offsetParent, left);
+    }
     return left + window.scrollX;
   }
   var SnapElement = class {
     element;
     options;
     align;
+    // @ts-expect-error
     rect = {};
     wrapperResizeObserver;
     resizeObserver;
     debouncedWrapperResize;
-    constructor(element, { align = ["start"], ignoreSticky = true, ignoreTransform = false } = {}) {
+    constructor(element, {
+      align = ["start"],
+      ignoreSticky = true,
+      ignoreTransform = false
+    } = {}) {
       this.element = element;
-      this.options = {
-        align,
-        ignoreSticky,
-        ignoreTransform
-      };
+      this.options = { align, ignoreSticky, ignoreTransform };
       this.align = [align].flat();
       this.debouncedWrapperResize = debounce2(this.onWrapperResize, 500);
       this.wrapperResizeObserver = new ResizeObserver(this.debouncedWrapperResize);
@@ -3299,13 +4380,20 @@
       this.wrapperResizeObserver.disconnect();
       this.resizeObserver.disconnect();
     }
-    setRect({ top, left, width, height, element } = {}) {
+    setRect({
+      top,
+      left,
+      width,
+      height,
+      element
+    } = {}) {
       top = top ?? this.rect.top;
       left = left ?? this.rect.left;
       width = width ?? this.rect.width;
       height = height ?? this.rect.height;
       element = element ?? this.rect.element;
-      if (top === this.rect.top && left === this.rect.left && width === this.rect.width && height === this.rect.height && element === this.rect.element) return;
+      if (top === this.rect.top && left === this.rect.left && width === this.rect.width && height === this.rect.height && element === this.rect.element)
+        return;
       this.rect.top = top;
       this.rect.y = top;
       this.rect.width = width;
@@ -3328,19 +4416,13 @@
         left = rect.left + scrollLeft(this.element);
       }
       if (this.options.ignoreSticky) addParentSticky(this.element);
-      this.setRect({
-        top,
-        left
-      });
+      this.setRect({ top, left });
     };
     onResize = ([entry]) => {
       if (!entry?.borderBoxSize[0]) return;
       const width = entry.borderBoxSize[0].inlineSize;
       const height = entry.borderBoxSize[0].blockSize;
-      this.setRect({
-        width,
-        height
-      });
+      this.setRect({ width, height });
     };
   };
   var index = 0;
@@ -3348,19 +4430,21 @@
     return index++;
   }
   var Snap = class {
-    options;
-    elements = /* @__PURE__ */ new Map();
-    snaps = /* @__PURE__ */ new Map();
-    viewport = {
-      width: window.innerWidth,
-      height: window.innerHeight
-    };
-    isStopped = false;
-    onSnapDebounced;
-    currentSnapIndex;
-    constructor(lenis2, { type = "proximity", lerp: lerp2, easing, duration, distanceThreshold = "50%", debounce: debounceDelay = 500, onSnapStart, onSnapComplete } = {}) {
+    constructor(lenis2, {
+      type = "proximity",
+      lerp: lerp2,
+      easing,
+      duration,
+      distanceThreshold = "50%",
+      // useless when type is "mandatory"
+      debounce: debounceDelay = 500,
+      onSnapStart,
+      onSnapComplete
+    } = {}) {
       this.lenis = lenis2;
-      if (!window.lenis) window.lenis = {};
+      if (!window.lenis) {
+        window.lenis = {};
+      }
       window.lenis.snap = true;
       this.options = {
         type,
@@ -3374,12 +4458,25 @@
       };
       this.onWindowResize();
       window.addEventListener("resize", this.onWindowResize);
-      this.onSnapDebounced = debounce2(this.onSnap, this.options.debounce);
+      this.onSnapDebounced = debounce2(
+        this.onSnap,
+        this.options.debounce
+      );
       this.lenis.on("virtual-scroll", this.onSnapDebounced);
     }
+    options;
+    elements = /* @__PURE__ */ new Map();
+    snaps = /* @__PURE__ */ new Map();
+    viewport = {
+      width: window.innerWidth,
+      height: window.innerHeight
+    };
+    isStopped = false;
+    onSnapDebounced;
+    currentSnapIndex;
     /**
-    * Destroy the snap instance
-    */
+     * Destroy the snap instance
+     */
     destroy() {
       this.lenis.off("virtual-scroll", this.onSnapDebounced);
       window.removeEventListener("resize", this.onWindowResize);
@@ -3388,43 +4485,45 @@
       });
     }
     /**
-    * Start the snap after it has been stopped
-    */
+     * Start the snap after it has been stopped
+     */
     start() {
       this.isStopped = false;
     }
     /**
-    * Stop the snap
-    */
+     * Stop the snap
+     */
     stop() {
       this.isStopped = true;
     }
     /**
-    * Add a snap to the snap instance
-    *
-    * @param value The value to snap to
-    * @param userData User data that will be forwarded through the snap event
-    * @returns Unsubscribe function
-    */
+     * Add a snap to the snap instance
+     *
+     * @param value The value to snap to
+     * @param userData User data that will be forwarded through the snap event
+     * @returns Unsubscribe function
+     */
     add(value) {
       const id = uid();
       this.snaps.set(id, { value });
       return () => this.snaps.delete(id);
     }
     /**
-    * Add an element to the snap instance
-    *
-    * @param element The element to add
-    * @param options The options for the element
-    * @returns Unsubscribe function
-    */
+     * Add an element to the snap instance
+     *
+     * @param element The element to add
+     * @param options The options for the element
+     * @returns Unsubscribe function
+     */
     addElement(element, options = {}) {
       const id = uid();
       this.elements.set(id, new SnapElement(element, options));
       return () => this.elements.delete(id);
     }
     addElements(elements, options = {}) {
-      const map = [...elements].map((element) => this.addElement(element, options));
+      const map = [...elements].map(
+        (element) => this.addElement(element, options)
+      );
       return () => {
         map.forEach((remove) => {
           remove();
@@ -3441,10 +4540,16 @@
       this.elements.forEach(({ rect, align }) => {
         let value;
         align.forEach((align2) => {
-          if (align2 === "start") value = rect.top;
-          else if (align2 === "center") value = isHorizontal ? rect.left + rect.width / 2 - this.viewport.width / 2 : rect.top + rect.height / 2 - this.viewport.height / 2;
-          else if (align2 === "end") value = isHorizontal ? rect.left + rect.width - this.viewport.width : rect.top + rect.height - this.viewport.height;
-          if (typeof value === "number") snaps.push({ value: Math.ceil(value) });
+          if (align2 === "start") {
+            value = rect.top;
+          } else if (align2 === "center") {
+            value = isHorizontal ? rect.left + rect.width / 2 - this.viewport.width / 2 : rect.top + rect.height / 2 - this.viewport.height / 2;
+          } else if (align2 === "end") {
+            value = isHorizontal ? rect.left + rect.width - this.viewport.width : rect.top + rect.height - this.viewport.height;
+          }
+          if (typeof value === "number") {
+            snaps.push({ value: Math.ceil(value) });
+          }
         });
       });
       snaps = snaps.sort((a, b) => Math.abs(a.value) - Math.abs(b.value));
@@ -3487,15 +4592,20 @@
       if (this.options.type === "mandatory") return Number.POSITIVE_INFINITY;
       const { isHorizontal } = this.lenis;
       const axis = isHorizontal ? "width" : "height";
-      if (typeof this.options.distanceThreshold === "string" && this.options.distanceThreshold.endsWith("%")) distanceThreshold = Number(this.options.distanceThreshold.replace("%", "")) / 100 * this.viewport[axis];
-      else if (typeof this.options.distanceThreshold === "number") distanceThreshold = this.options.distanceThreshold;
-      else distanceThreshold = this.viewport[axis];
+      if (typeof this.options.distanceThreshold === "string" && this.options.distanceThreshold.endsWith("%")) {
+        distanceThreshold = Number(this.options.distanceThreshold.replace("%", "")) / 100 * this.viewport[axis];
+      } else if (typeof this.options.distanceThreshold === "number") {
+        distanceThreshold = this.options.distanceThreshold;
+      } else {
+        distanceThreshold = this.viewport[axis];
+      }
       return distanceThreshold;
     }
     onSnap = (e) => {
       if (this.isStopped) return;
       if (e.event.type === "touchmove") return;
-      if (this.options.type === "lock" && this.lenis.userData?.initiator === "snap") return;
+      if (this.options.type === "lock" && this.lenis.userData?.initiator === "snap")
+        return;
       let { scroll, isHorizontal } = this.lenis;
       const delta = isHorizontal ? e.deltaX : e.deltaY;
       scroll = Math.ceil(this.lenis.scroll + delta);
@@ -3505,19 +4615,26 @@
       const prevSnapIndex = snaps.findLastIndex(({ value }) => value < scroll);
       const nextSnapIndex = snaps.findIndex(({ value }) => value > scroll);
       if (this.options.type === "lock") {
-        if (delta > 0) snapIndex = nextSnapIndex;
-        else if (delta < 0) snapIndex = prevSnapIndex;
+        if (delta > 0) {
+          snapIndex = nextSnapIndex;
+        } else if (delta < 0) {
+          snapIndex = prevSnapIndex;
+        }
       } else {
         const prevSnap = snaps[prevSnapIndex];
         const distanceToPrevSnap = prevSnap ? Math.abs(scroll - prevSnap.value) : Number.POSITIVE_INFINITY;
         const nextSnap = snaps[nextSnapIndex];
-        snapIndex = distanceToPrevSnap < (nextSnap ? Math.abs(scroll - nextSnap.value) : Number.POSITIVE_INFINITY) ? prevSnapIndex : nextSnapIndex;
+        const distanceToNextSnap = nextSnap ? Math.abs(scroll - nextSnap.value) : Number.POSITIVE_INFINITY;
+        snapIndex = distanceToPrevSnap < distanceToNextSnap ? prevSnapIndex : nextSnapIndex;
       }
       if (snapIndex === void 0) return;
       if (snapIndex === -1) return;
       snapIndex = Math.max(0, Math.min(snapIndex, snaps.length - 1));
       const snap2 = snaps[snapIndex];
-      if (Math.abs(scroll - snap2.value) <= this.distanceThreshold) this.goTo(snapIndex);
+      const distance = Math.abs(scroll - snap2.value);
+      if (distance <= this.distanceThreshold) {
+        this.goTo(snapIndex);
+      }
     };
     resize() {
       this.elements.forEach((element) => {
@@ -3532,6 +4649,10 @@
       const trigger = e.target.closest('[data-panel="layer1"]');
       if (trigger) {
         const stepNumber = trigger.dataset.step;
+        document.querySelectorAll(".offcanvas.show").forEach((p) => {
+          const inst = bootstrap.Offcanvas.getInstance(p);
+          if (inst) inst.hide();
+        });
         state.panelStack = [];
         openPanel("layer1", stepNumber);
       }
@@ -3568,9 +4689,15 @@
     const content = getPanelContent(panelType, contentId);
     if (content) {
       const titleElement = document.getElementById(`${panelId}-title`);
-      const demoBadgeText = window.telarLang?.demoPanelBadge || "Demo content";
-      const demoBadge = content.demo ? `<span class="demo-badge-inline" style="margin-left: 0.5rem;">${demoBadgeText}</span>` : "";
-      titleElement.innerHTML = content.title + demoBadge;
+      titleElement.textContent = content.title;
+      if (content.demo) {
+        const demoBadgeText = window.telarLang?.demoPanelBadge || "Demo content";
+        const badge = document.createElement("span");
+        badge.className = "demo-badge-inline";
+        badge.style.marginLeft = "0.5rem";
+        badge.textContent = demoBadgeText;
+        titleElement.appendChild(badge);
+      }
       const contentElement = document.getElementById(`${panelId}-content`);
       contentElement.innerHTML = content.html;
       if (window.Telar && window.Telar.initializeGlossaryLinks) {
@@ -3608,11 +4735,8 @@
     if (bsOffcanvas) {
       bsOffcanvas.hide();
     }
-    const stackAfterClose = state.panelStack.filter((p) => p.type !== panelType);
-    const savedStack = state.panelStack;
-    state.panelStack = stackAfterClose;
+    state.panelStack = state.panelStack.filter((p) => p.type !== panelType);
     writeHash();
-    state.panelStack = savedStack;
     setTimeout(() => {
       const anyPanelOpen = document.querySelector(".offcanvas.show");
       if (!anyPanelOpen) {
@@ -3625,7 +4749,6 @@
     if (state.panelStack.length > 0) {
       const top = state.panelStack[state.panelStack.length - 1];
       closePanel(top.type);
-      state.panelStack.pop();
     }
   }
   function closeAllPanels() {
@@ -3652,7 +4775,7 @@
       }, step.object);
       if (step.layer2_title && step.layer2_title.trim() !== "" || step.layer2_text && step.layer2_text.trim() !== "") {
         const buttonLabel = step.layer2_button && step.layer2_button.trim() !== "" ? step.layer2_button : window.telarLang.goDeeper;
-        html += `<p><button class="panel-trigger" data-panel="layer2" data-step="${contentId}">${buttonLabel} \u2192</button></p>`;
+        html += `<p><button class="panel-trigger" data-panel="layer2" data-step="${contentId}">${escapeHtml(buttonLabel)} \u2192</button></p>`;
       }
       return {
         title: step.layer1_title || step.layer1_button || "Layer 1",
@@ -3691,7 +4814,7 @@
       const objectsData = window.objectsData || [];
       const panelObj = objectId ? objectsData.find((o) => o.object_id === objectId) || {} : {};
       const panelAlt = panelObj.alt_text || panelObj.title || objectId || "Panel image";
-      html += `<img src="${mediaUrl}" alt="${panelAlt}" class="img-fluid">`;
+      html += `<img src="${escapeHtml(mediaUrl)}" alt="${escapeHtml(panelAlt)}" class="img-fluid">`;
     }
     return html;
   }
@@ -3743,6 +4866,22 @@
 
   // assets/js/telar-story/deep-link.js
   var _isScrollDrivenHashUpdate = false;
+  var _deepLinkTimers = [];
+  function _cancelDeepLinkTimers() {
+    _deepLinkTimers.forEach(clearTimeout);
+    _deepLinkTimers = [];
+  }
+  function _armDeepLinkCancellation() {
+    const cancel = () => {
+      _cancelDeepLinkTimers();
+      window.removeEventListener("wheel", cancel);
+      window.removeEventListener("keydown", cancel);
+      window.removeEventListener("touchstart", cancel);
+    };
+    window.addEventListener("wheel", cancel, { passive: true });
+    window.addEventListener("keydown", cancel);
+    window.addEventListener("touchstart", cancel, { passive: true });
+  }
   var FRAGMENT_RE = /^#s(\d+)(?:l(\d+)(?:(g|ps)(\d+))?)?$/;
   function parseFragment(hash) {
     if (!hash || hash === "#") return null;
@@ -3827,16 +4966,11 @@
     }
     if (state.lenis) {
       const targetPx = (targetIndex + 1) * window.innerHeight;
-      state.lenis.stop();
-      document.documentElement.scrollTop = targetPx;
-      state.lenis.animatedScroll = targetPx;
-      state.lenis.targetScroll = targetPx;
+      state.lenis.scrollTo(targetPx, { immediate: true, force: true });
+      if (state.snap) state.snap.currentSnapIndex = targetIndex + 1;
       activateCard(targetIndex, "forward");
       state.currentIndex = targetIndex;
       state.scrollPosition = targetIndex + 1;
-      requestAnimationFrame(() => {
-        state.lenis.start();
-      });
     } else {
       state.currentMobileStep = targetIndex;
       state.mobileInIntro = false;
@@ -3858,16 +4992,11 @@
     if (targetIndex < 0) return;
     if (state.lenis) {
       const targetPx = (targetIndex + 1) * window.innerHeight;
-      state.lenis.stop();
-      document.documentElement.scrollTop = targetPx;
-      state.lenis.animatedScroll = targetPx;
-      state.lenis.targetScroll = targetPx;
+      state.lenis.scrollTo(targetPx, { immediate: true, force: true });
+      if (state.snap) state.snap.currentSnapIndex = targetIndex + 1;
       activateCard(targetIndex, "forward");
       state.currentIndex = targetIndex;
       state.scrollPosition = targetIndex + 1;
-      requestAnimationFrame(() => {
-        state.lenis.start();
-      });
     } else {
       state.currentMobileStep = targetIndex;
       state.mobileInIntro = false;
@@ -3884,25 +5013,28 @@
       const stepNumber = state.steps[targetIndex]?.dataset?.step;
       if (stepNumber) {
         let delay = 100;
+        const onTarget = () => state.lenis ? state.currentIndex === targetIndex : state.currentMobileStep === targetIndex;
         if (parsed.layer >= 2) {
-          setTimeout(() => {
-            openPanel("layer1", stepNumber);
-          }, delay);
+          _deepLinkTimers.push(setTimeout(() => {
+            if (onTarget()) openPanel("layer1", stepNumber);
+          }, delay));
           delay += 200;
         }
-        setTimeout(() => {
-          openPanel("layer" + parsed.layer, stepNumber);
-        }, delay);
+        _deepLinkTimers.push(setTimeout(() => {
+          if (onTarget()) openPanel("layer" + parsed.layer, stepNumber);
+        }, delay));
         delay += 200;
         if (parsed.subType === "g" && parsed.subN !== null) {
-          setTimeout(() => {
+          _deepLinkTimers.push(setTimeout(() => {
+            if (!onTarget()) return;
             const panelContent = document.getElementById("panel-layer" + parsed.layer + "-content");
             if (panelContent) {
               const target = panelContent.querySelector(`[data-deep-link-n="${parsed.subN}"]`);
               if (target) target.click();
             }
-          }, delay);
+          }, delay));
         }
+        if (_deepLinkTimers.length) _armDeepLinkCancellation();
       }
     }
   }
@@ -3922,14 +5054,23 @@
       console.error("scroll-engine: .scroll-surface or .card-stack not found in DOM");
       return;
     }
+    if (rafId) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+    if (dwellTimer) {
+      clearTimeout(dwellTimer);
+      dwellTimer = null;
+    }
     state.steps = Array.from(document.querySelectorAll(".story-step"));
     history.scrollRestoration = "manual";
     totalPositions = stepCount + 1;
     surface.style.height = `${totalPositions * window.innerHeight}px`;
+    const prefersReduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     lenis = new Lenis({
       lerp: 0.06,
       // lower = heavier, more contemplative feel
-      smoothWheel: true,
+      smoothWheel: !prefersReduced,
       wheelMultiplier: 0.5,
       // scroll sensitivity
       autoRaf: false,
@@ -3975,8 +5116,8 @@
       lenis.raf(time);
       rafId = requestAnimationFrame(raf);
     });
-    window.addEventListener("resize", () => {
-      surface.style.height = `${totalPositions * window.innerHeight}px`;
+    onViewportResize(({ viewport }) => {
+      surface.style.height = `${totalPositions * viewport.h}px`;
       lenis.resize();
       registerSnapPoints(totalPositions);
     });
@@ -4092,7 +5233,7 @@
     const progress = clamped - stepIndex;
     state.scrollProgress = progress;
     setCardProgress(stepIndex, progress);
-    lerpIiifPosition(stepIndex, progress, window.storyData?.steps || []);
+    lerpIiifPosition(stepIndex, progress, state.stepsData || []);
     if (stepIndex !== state.currentIndex && !keyboardNavInFlight) {
       const direction = stepIndex > state.currentIndex ? "forward" : "backward";
       state.scrollDriven = true;
@@ -4168,8 +5309,7 @@
     document.body.appendChild(navContainer);
     return { container: navContainer, prev: prevButton, next: nextButton };
   }
-  function initializeButtonNavigation(mode) {
-    console.log(`Initializing ${mode} button navigation`);
+  function initializeButtonNavigation() {
     state.steps = Array.from(document.querySelectorAll(".story-step"));
     initializeLoadingShimmer();
     state.steps.forEach((step) => {
@@ -4185,7 +5325,6 @@
     buttons.prev.addEventListener("click", goToPreviousMobileStep);
     buttons.next.addEventListener("click", goToNextMobileStep);
     updateMobileButtonStates();
-    console.log(`${mode.charAt(0).toUpperCase() + mode.slice(1)} navigation initialized with ${state.steps.length} steps`);
   }
   function goToNextMobileStep() {
     if (state.mobileInIntro) {
@@ -4260,7 +5399,6 @@
       return;
     }
     if (state.mobileNavigationCooldown) {
-      console.log("Mobile navigation on cooldown, ignoring tap");
       return;
     }
     const newStep = state.steps[newIndex];
@@ -4274,7 +5412,6 @@
       state.mobileNavigationCooldown = false;
     }, MOBILE_NAV_COOLDOWN);
     const direction = newIndex > state.currentMobileStep ? "forward" : "backward";
-    console.log(`Mobile navigation: ${state.currentMobileStep} \u2192 ${newIndex} (${direction})`);
     state.steps[state.currentMobileStep].classList.remove("mobile-active");
     state.steps[newIndex].classList.add("mobile-active");
     state.currentMobileStep = newIndex;
@@ -4407,6 +5544,9 @@
   }
 
   // assets/js/telar-story/main.js
+  if (typeof window !== "undefined") {
+    window.IiifViewer = IiifViewer;
+  }
   function initializeStory() {
     const viewerConfig = window.telarConfig?.viewer_preloading || {};
     state.config.maxViewerCards = Math.min(viewerConfig.max_viewer_cards || 10, 15);
@@ -4420,17 +5560,22 @@
       messiness: window.telarConfig?.cardMessiness ?? 20
     };
     initCardPool(window.storyData, cardConfig);
-    state.isMobileViewport = window.innerWidth < 768;
-    const isEmbedMode = window.telarEmbed?.enabled || false;
+    state.isEmbed = window.telarEmbed?.enabled || false;
+    state.layoutMode = getLayoutMode();
+    onLayoutChange(({ to }) => {
+      state.layoutMode = to;
+      const activeCard = document.querySelector(".text-card.is-active");
+      state.cardOverlayRect = activeCard ? activeCard.getBoundingClientRect() : null;
+    });
     const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
-    if (isEmbedMode) {
-      initializeButtonNavigation("embed");
+    if (state.isEmbed) {
+      initializeButtonNavigation();
       const stepCount = (window.storyData?.steps || []).filter((s) => !s._metadata).length;
       initScrollEngine(stepCount);
-    } else if (state.isMobileViewport) {
-      initializeButtonNavigation("mobile");
+    } else if (state.layoutMode === "vertical") {
+      initializeButtonNavigation();
     } else if (isIOS) {
-      initializeButtonNavigation("mobile");
+      initializeButtonNavigation();
     } else {
       const stepCount = (window.storyData?.steps || []).filter((s) => !s._metadata).length;
       initScrollEngine(stepCount);
@@ -4489,7 +5634,8 @@
     openPanel,
     getManifestUrl,
     closeAllPanels,
-    getScrollEngineState
+    getScrollEngineState,
+    navigateToStep
   };
 })();
 //# sourceMappingURL=telar-story.js.map

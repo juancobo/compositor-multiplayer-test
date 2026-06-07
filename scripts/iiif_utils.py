@@ -20,7 +20,7 @@ without duplicating it.
 None of these functions are meant to be run directly. They are
 imported by the two entry-point scripts.
 
-Version: v0.9.3-beta
+Version: v1.5.0
 """
 
 import json
@@ -175,12 +175,20 @@ def preprocess_image(image_path):
             elif file_ext == '.png' and not needs_conversion:
                 print(f"  ⚠️  Converting PNG to JPEG for IIIF processing")
 
-            # Save to temporary JPEG file
+            # Save to temporary JPEG file. Record temp_path immediately so that
+            # if the save itself raises, the just-created file is still unlinked
+            # here rather than leaking (the caller's finally only unlinks a
+            # temp_path that was successfully returned).
             tf = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False)
-            converted_img.save(tf.name, 'JPEG', quality=95)
-            processed_path = Path(tf.name)
             temp_path = tf.name
             tf.close()
+            try:
+                converted_img.save(temp_path, 'JPEG', quality=95)
+                processed_path = Path(temp_path)
+            except Exception as save_err:
+                print(f"  ⚠️  Error saving converted image: {save_err}")
+                Path(temp_path).unlink(missing_ok=True)
+                temp_path = None  # processed_path stays as the original input
     except Exception as e:
         print(f"  ⚠️  Error preprocessing image: {e}")
 
@@ -292,8 +300,8 @@ def patch_info_json(tiles_dir, object_id, base_url):
         sizes.sort(key=lambda s: s['width'])
         info['sizes'] = sizes
 
-    # Ensure scaleFactors is never empty — OpenSeadragon (inside Tify)
-    # crashes with RangeError when it encounters an empty array. This
+    # Ensure scaleFactors is never empty — OpenSeadragon crashes with
+    # RangeError when it encounters an empty array. This
     # happens for images smaller than the tile size (512px), where libvips
     # produces no downscale levels.
     tiles = info.get('tiles', [])
@@ -360,11 +368,15 @@ def generate_full_max(processed_path, tiles_dir):
                 thumb = img.resize((sw, sh), Image.LANCZOS)
                 thumb.save(sf_dir / 'default.jpg', 'JPEG', quality=85)
 
-    # Generate width-only thumbnails for sizes that IIIF viewers request
-    # but that don't exist in the static Level 0 tile pyramid. TIFY v0.35
-    # always requests full/96,/0/default.jpg for its page thumbnail
-    # regardless of the service profile level, causing 404s on static
-    # tiles that break rendering on Windows browsers.
+    # Generate width-only thumbnails for small sizes the static Level 0
+    # tile pyramid does not otherwise contain. The 96px width originated
+    # for Tify v0.35 (removed in v1.4.0), which hardcoded a
+    # full/96,/0/default.jpg request regardless of profile level. It is
+    # RETAINED because patch_info_json folds these widths into info.json's
+    # sizes array, and the homepage object-grid IIIF thumbnail loader
+    # (.story-iiif-thumbnail) requests small thumbnails through info.json —
+    # so these entries now back the homepage, not Tify. Removing the width
+    # would regress homepage thumbnails; verify the grid before changing it.
     VIEWER_THUMB_WIDTHS = [96]
     for tw in VIEWER_THUMB_WIDTHS:
         if tw >= w:
@@ -377,7 +389,7 @@ def generate_full_max(processed_path, tiles_dir):
             thumb.save(thumb_dir / 'default.jpg', 'JPEG', quality=85)
 
     # Create full/{w},{h}/ counterparts for any width-only directories
-    # (from libvips or from the Tify thumbnail above). The homepage
+    # (from libvips or from the width-only thumbnails above). The homepage
     # thumbnail JS constructs URLs as full/{w},{h}/, not full/{w},/.
     full_dir = tiles_dir / 'full'
     if full_dir.exists():

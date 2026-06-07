@@ -23,7 +23,7 @@
  *
  * Manifest prefetching — `prefetchStoryManifests()` fires off fetches for
  * every unique object's manifest at page load, warming the browser cache
- * so that Tify viewer instances created later do not wait on the network.
+ * so that IIIF wrapper instances created later do not wait on the network.
  * It also measures connection speed: if manifests take more than a second
  * on average, the loading threshold and minimum-ready counts are adjusted
  * so the shimmer state stays visible longer and does not flash.
@@ -43,12 +43,12 @@
  * the full viewer card lifecycle — creation, destruction, positioning,
  * object switching, and nearby preloading. Those responsibilities moved
  * to iiif-card.js (plate lifecycle and OSD positioning) and card-pool.js
- * (card-stack orchestration and Tify injection) during the v1.0.0-beta
+ * (card-stack orchestration and viewer injection) during the v1.0.0-beta
  * rewrite. The old functions were tree-shaken from the bundle but
  * remained in the source, which caused confusion when fixes were applied
  * to dead code paths. They have now been removed entirely.
  *
- * @version v1.0.0-beta
+ * @version v1.5.0
  */
 
 import { state } from './state.js';
@@ -86,8 +86,10 @@ export function buildObjectsIndex() {
  *
  * For multi-page objects (PDFs), when a page number is specified, the local
  * path points to the per-page single-canvas manifest rather than the root
- * multi-canvas manifest. External manifests do not currently support
- * per-page selection — page handling is deferred to the viewer.
+ * multi-canvas manifest. External multi-page manifests are returned whole;
+ * the caller (`card-pool.js _initOsdInPlate`) derives `startPage = page - 1`
+ * and passes it to the IiifViewer wrapper, which opens the requested
+ * canvas without needing per-page manifest variants on the external host.
  *
  * @param {string} objectId - The object identifier.
  * @param {number} [page] - Optional page number for multi-page objects.
@@ -103,7 +105,7 @@ export function getManifestUrl(objectId, page) {
 
   const sourceUrl = object.source_url || object.iiif_manifest;
   if (sourceUrl && sourceUrl.trim() !== '') {
-    return sourceUrl;  // External manifests: page handling deferred
+    return sourceUrl;  // External manifests: caller passes `page` to the wrapper via startPage
   }
 
   return buildLocalInfoJsonUrl(objectId, page);
@@ -125,11 +127,9 @@ function buildLocalInfoJsonUrl(objectId, page) {
   const basePath = getBasePath();
   if (page) {
     const manifestUrl = `${window.location.origin}${basePath}/iiif/objects/${objectId}/page-${page}/manifest.json`;
-    console.log('Building local IIIF page manifest URL:', manifestUrl);
     return manifestUrl;
   }
   const manifestUrl = `${window.location.origin}${basePath}/iiif/objects/${objectId}/manifest.json`;
-  console.log('Building local IIIF manifest URL:', manifestUrl);
   return manifestUrl;
 }
 
@@ -139,13 +139,19 @@ function buildLocalInfoJsonUrl(objectId, page) {
  * Prefetch all story manifests at page load and measure connection speed.
  *
  * Iterates every unique object referenced by a [data-object] element in
- * the page. For each object with an external manifest (iiif_manifest field),
- * fires a fetch to warm the browser cache. Records the time each fetch
- * takes so adjustThresholdsForConnection() can tune the loading shimmer
- * for slow networks.
+ * the page. For each object with an external IIIF manifest, fires a cache-warming
+ * fetch and records how long it takes so adjustThresholdsForConnection() can tune
+ * the loading shimmer for slow networks.
+ *
+ * Resolves source_url || iiif_manifest (source_url is what the Compositor writes;
+ * iiif_manifest is the legacy field) so Compositor-published stories get warmed
+ * too. Video objects (whose source_url is a media host, not a manifest) are
+ * skipped; audio objects use local files and have no external URL to warm.
  *
  * Runs as a background promise — does not block page initialisation.
  */
+const _PREFETCH_SKIP_HOSTS = ['youtube.com', 'youtu.be', 'vimeo.com', 'drive.google.com'];
+
 export async function prefetchStoryManifests() {
   const objectIds = [...new Set(
     Array.from(document.querySelectorAll('[data-object]'))
@@ -155,17 +161,37 @@ export async function prefetchStoryManifests() {
 
   if (objectIds.length === 0) return;
 
-  await Promise.all(objectIds.map(async (id) => {
-    try {
-      const objectData = state.objectsIndex[id];
-      if (objectData?.iiif_manifest) {
+  const manifestUrls = [...new Set(
+    objectIds
+      .map(id => state.objectsIndex[id])
+      .map(o => (o && (o.source_url || o.iiif_manifest) || '').trim())
+      .filter(url => url && !_PREFETCH_SKIP_HOSTS.some(h => url.includes(h)))
+  )];
+
+  if (manifestUrls.length === 0) {
+    adjustThresholdsForConnection();
+    return;
+  }
+
+  // Warm the browser cache with bounded concurrency so a multi-object story does
+  // not burst-open a connection per object. force-cache serves repeats from cache;
+  // draining the body lets the connection free promptly.
+  const CONCURRENCY = 3;
+  const queue = [...manifestUrls];
+  const worker = async () => {
+    while (queue.length) {
+      const url = queue.shift();
+      try {
         const start = performance.now();
-        await fetch(objectData.iiif_manifest);
-        const elapsed = performance.now() - start;
-        state.manifestLoadTimes.push(elapsed);
-      }
-    } catch (e) { /* silent fail — network errors handled gracefully */ }
-  }));
+        const resp = await fetch(url, { cache: 'force-cache' });
+        await resp.text().catch(() => {});
+        state.manifestLoadTimes.push(performance.now() - start);
+      } catch (e) { /* silent fail — network errors handled gracefully */ }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker)
+  );
 
   adjustThresholdsForConnection();
 }
@@ -191,11 +217,9 @@ function adjustThresholdsForConnection() {
   if (avgTime > 1000) {
     state.config.loadingThreshold = 1;
     state.config.minReadyViewers = Math.min(6, state.config.preloadSteps);
-    console.log(`Slow connection detected (${Math.round(avgTime)}ms avg), adjusting thresholds`);
   } else if (avgTime > 500) {
     state.config.loadingThreshold = Math.max(3, state.config.loadingThreshold - 2);
     state.config.minReadyViewers = Math.min(state.config.minReadyViewers + 1, state.config.preloadSteps);
-    console.log(`Moderate connection detected (${Math.round(avgTime)}ms avg), adjusting thresholds`);
   }
 }
 
@@ -215,11 +239,8 @@ export function initializeLoadingShimmer() {
     state.steps.map(step => step.dataset.object).filter(Boolean)
   ).size;
 
-  console.log(`Story has ${uniqueViewers} unique viewers (threshold: ${state.config.loadingThreshold})`);
-
   if (uniqueViewers >= state.config.loadingThreshold) {
     showViewerSkeletonState();
-    console.log(`Showing initial load shimmer (${uniqueViewers} >= ${state.config.loadingThreshold})`);
 
     const checkReadyViewers = () => {
       const readyCount = state.viewerCards.filter(v => v.isReady).length;
@@ -227,7 +248,6 @@ export function initializeLoadingShimmer() {
 
       if (readyCount >= targetReady) {
         hideViewerSkeletonState();
-        console.log(`Hiding shimmer: ${readyCount} viewers ready (target: ${targetReady})`);
       } else {
         setTimeout(checkReadyViewers, 200);
       }
